@@ -4,10 +4,11 @@
 const char *ssid = "WAFNAMOTOPARK";  
 const char *password = "motocross";
 
+/*
 IPAddress staticIP(192, 168, 5, 41); // static IP address
 IPAddress gateway(192, 168, 5, 1);    // network's gateway address
 IPAddress subnet(255, 255, 255, 0);   // network's subnet mask
-
+*/
 WebServer server(80);
 
 const int relayPins[] = {21, 19, 18, 5};
@@ -30,7 +31,7 @@ void setup() {
     digitalWrite(ledPin, HIGH);
   
    WiFi.begin(ssid, password);
-  WiFi.config(staticIP, gateway, subnet); 
+//  WiFi.config(staticIP, gateway, subnet); 
   while (WiFi.status() != WL_CONNECTED) {
     delay(1000);
     Serial.println("Connecting to WiFi..");
@@ -43,18 +44,22 @@ void setup() {
   server.on("/", HTTP_GET, []() {
     server.send(200, "text/plain", "Hello from ESP32!");
   });
-for (int i = 0; i < numRelays; i++) {
-  int relayNum = i + 1;
-  server.on("/"+String(relayNum) + "/on", HTTP_GET, [i, relayNum]() {
-    digitalWrite(relayPins[i], HIGH);
-    server.send(200, "text/plain", "Relay " + String(relayNum) + " turned on");
+
+ 
+  server.on("/master/on", HTTP_GET, []() {
+    enablePumps();
+    delay(2000);
+    onPumps();
+    server.send(200, "text/plain", "master turned on");
   });
 
-  server.on("/"+String(relayNum) + "/off", HTTP_GET, [i, relayNum]() {
-    digitalWrite(relayPins[i], LOW);
-    server.send(200, "text/plain", "Relay " + String(relayNum) + " turned off");
+  server.on("/master/off", HTTP_GET, []() {
+    digitalWrite(relayPins[1], LOW);
+    delay(500);
+    digitalWrite(relayPins[2], LOW);
+    server.send(200, "text/plain", "master turned off");
   });
-}
+
 
 
   server.begin();
@@ -68,4 +73,18 @@ void loop() {
     digitalWrite(ledPin, !digitalRead(ledPin)); // Toggle LED every 2 second
     delay(1000);
   }
+}
+
+void enablePumps(){
+     digitalWrite(relayPins[0], HIGH);
+}
+
+void disablePumps(){
+  digitalWrite(relayPins[0], LOW);
+}
+
+void onPumps(){
+     digitalWrite(relayPins[1], HIGH);
+    delay(4000);
+    digitalWrite(relayPins[2], HIGH);
 }
