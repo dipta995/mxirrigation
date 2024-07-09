@@ -1,3 +1,4 @@
+#include <WiFiManager.h>
 #include <ESP8266WiFi.h>
 #include <WiFiClient.h>
 #include <ESP8266WebServer.h>
@@ -6,13 +7,14 @@ bool debug = false;
 
 ESP8266WebServer server(80);
 
-const char *ssid = "WAFNAMOTOPARK";  
-const char *password = "motocross";
+//const char *ssid = "WAFNAMOTOPARK";  
+//const char *password = "motocross";
 
+/*
 IPAddress staticIP(192, 168, 5, 42); // static IP address
 IPAddress gateway(192, 168, 5, 1);    // network's gateway address
 IPAddress subnet(255, 255, 255, 0);   // network's subnet mask
-
+*/
 
 #define VALVE1_A D0
 #define VALVE1_B D1
@@ -66,24 +68,35 @@ delay(2000);
   digitalWrite( VALVE4_B, LOW );
 
 
-if(debug == false){
- if (!WiFi.config(staticIP, gateway, subnet)) {
-    Serial.println("STA Failed to configure");
-     digitalWrite(LED_BUILTIN, LOW);  // Turn the LED on
-  }
-}
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid, password);
-  Serial.println("");
+ //WiFiManager, Local intialization. Once its business is done, there is no need to keep it around
+    WiFiManager wm;
 
-  // Wait for connection
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-      digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN)); // Toggle LED every 2 second
-  }
-  digitalWrite(LED_BUILTIN, HIGH);
-  Serial.println("");
+    // reset settings - wipe stored credentials for testing
+    // these are stored by the esp library
+    // wm.resetSettings();
+
+    // Automatically connect using saved credentials,
+    // if connection fails, it starts an access point with the specified name ( "AutoConnectAP"),
+    // if empty will auto generate SSID, if password is blank it will be anonymous AP (wm.autoConnect())
+    // then goes into a blocking loop awaiting configuration and will return success result
+
+    bool res;
+    wm.setSTAStaticIPConfig(IPAddress(192,168,5,41), IPAddress(192,168,5,1), IPAddress(255,255,255,0));
+    wm.setShowStaticFields(true);
+    wm.setShowDnsFields(true);
+    // res = wm.autoConnect(); // auto generated AP name from chipid
+    // res = wm.autoConnect("AutoConnectAP"); // anonymous ap
+    res = wm.autoConnect("ESP-VALVE-SERVER","password"); // password protected ap
+
+    if(!res) {
+        Serial.println("Failed to connect");
+        // ESP.restart();
+    } 
+    else {
+        //if you get here you have connected to the WiFi    
+        Serial.println("connected...yeey :)");
+    }
+
   Serial.print("Connected to ");
   Serial.println(ssid);
   Serial.print("IP address: ");

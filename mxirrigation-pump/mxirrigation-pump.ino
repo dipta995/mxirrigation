@@ -40,6 +40,10 @@ unsigned long enableTime;
 #define openPin 26
 
 void setup() {
+
+   pinMode(ledPin, OUTPUT);
+  digitalWrite(ledPin, LOW);
+  
   Serial.begin(115200);
   while (!Serial) delay(1);
   Serial.println("\n            Generator Admin by MxSolutions.it");
@@ -58,7 +62,7 @@ void setup() {
 pinMode(closedPin, INPUT);
 pinMode(openPin, INPUT);
     
-  pinMode(ledPin, OUTPUT);
+
   for (int i=0; i< numRelays ;i++) {
   pinMode(relayPins[i], OUTPUT);
   }
@@ -68,7 +72,7 @@ pinMode(openPin, INPUT);
       digitalWrite(relayPins[i], LOW);
 
   }
-    digitalWrite(ledPin, HIGH);
+    
   
    WiFi.begin(ssid, password);
   WiFi.config(staticIP, gateway, subnet); 
@@ -76,7 +80,7 @@ pinMode(openPin, INPUT);
     delay(1000);
     Serial.println("Connecting to WiFi..");
   }
-
+digitalWrite(ledPin, HIGH);
   Serial.println("Connected to WiFi");
   Serial.print("IP address: ");
   Serial.println(WiFi.localIP());
@@ -88,20 +92,20 @@ pinMode(openPin, INPUT);
     enablePumps();
     delay(2000);
     onPumps();
-    server.send(200, "text/html", "<font color=green size=5>master turned on</font>");
+    server.send(200, "text/html", "<font color=red size=5>master turned on</font>");
   });
 
   server.on("/single", HTTP_GET, []() {
     enablePumps();
     delay(2000);
     onPumpOne();
-    server.send(200, "text/html", "<font color=green size=5>single turned on</font>");
+    server.send(200, "text/html", "<font color=red size=5>single turned on</font>");
   });
 
   server.on("/master/off", HTTP_GET, []() {
     offPumps();
     disablePumps();
-    server.send(200, "text/plain", "<font color=green size=5>master turned off</font>");
+    server.send(200, "text/html", "<font color=green size=5>master turned off</font>");
   });
 
 
@@ -114,12 +118,14 @@ pinMode(openPin, INPUT);
     Serial.println(pressureTimer);
      pinMode( VALVE1_A, OUTPUT );
   pinMode( VALVE1_B, OUTPUT );
+  /*
 closeValve();
 delay(3000);
 openValve();
 closeValve();
 delay(3000);
 openValve();
+*/
 }
 
 void loop() {
@@ -136,9 +142,11 @@ void loop() {
     pressureTimer = millis() + 1000;
   
       raw = analogRead(analogPin);
+      raw = analogRead(analogPin);
+      raw = analogRead(analogPin);
        Serial.print("Raw: ");
     Serial.println(raw);
-    valore = raw;
+    valore = map(raw, 0, 4095, 0, 12);
   }
   
 }
