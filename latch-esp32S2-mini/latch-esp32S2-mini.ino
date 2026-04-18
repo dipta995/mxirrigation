@@ -6,10 +6,10 @@ bool debug = false;
 
 WebServer server(80);
 
-const char *ssid = "WAFNAMOTOPARK";  
+const char *ssid = "WMPHOUSE";  
 const char *password = "motocross";
 
-IPAddress staticIP(192, 168, 5, 41); // static IP address
+IPAddress staticIP(192, 168, 5, 44); // static IP address
 IPAddress gateway(192, 168, 5, 1);    // network's gateway address
 IPAddress subnet(255, 255, 255, 0);   // network's subnet mask
 

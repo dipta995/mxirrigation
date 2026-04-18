@@ -1,9 +1,10 @@
 #include <WiFi.h>
 #include <WebServer.h>
+#include <ESPping.h>
 
-const char* FW_VERSION = "1000";
+const char* FW_VERSION = "1100";
 
-const char *ssid = "WAFNAMOTOPARK";  
+const char *ssid = "WMPSERVICE";  
 const char *password = "motocross";
 
 
@@ -16,6 +17,15 @@ WebServer server(80);
 const int relayPins[] = {21, 19, 18, 5};
 const int numRelays = sizeof(relayPins) / sizeof(relayPins[0]);
 const int ledPin = 25; 
+short int pingCounter = 0;
+int offlineCounter = 0;
+bool online = false;
+
+unsigned long startMillis;  //some global variables available anywhere in the program
+unsigned long currentMillis;
+unsigned long lastMsg = 0;
+const unsigned long period = 30000;  //the value is a number of milliseconds
+bool counterFlag = false;
 
 // pressure sensor
 int analogPin = 36;
@@ -25,8 +35,10 @@ float Vout = 0;
 float R1 = 100;
 float R2 = 0;
 float buffer = 0;
-int valore = 0;
+float valore = 0;
 unsigned int long pressureTimer;
+
+bool pressureAlarm = false;
 
 bool masterOn = false;
 bool minPressure = false;
@@ -76,9 +88,21 @@ pinMode(openPin, INPUT);
   
    WiFi.begin(ssid, password);
   WiFi.config(staticIP, gateway, subnet); 
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(1000);
-    Serial.println("Connecting to WiFi..");
+    while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+    // inserire reboot qua
+    if(counterFlag == false){
+      startMillis = millis();  //initial start time
+      counterFlag = true;
+    }else{
+      currentMillis = millis();  //get the current "time" (actually the number of milliseconds since the program started)
+      if (currentMillis - startMillis >= period)  //test whether the period has elapsed
+      {
+          ESP.restart();
+       }
+    }
+    
   }
 digitalWrite(ledPin, HIGH);
   Serial.println("Connected to WiFi");
@@ -133,8 +157,36 @@ void loop() {
    //  WiFi connection check
   if (WiFi.status() != WL_CONNECTED) {
     digitalWrite(ledPin, !digitalRead(ledPin)); // Toggle LED every 2 second
-    delay(1000);
+    //delay(1000);
   }
+
+// se le pompe son spente facciamo check connessione con un ping
+if(masterOn == false ){
+// pinghiamo ogni 10 secondi
+  unsigned long now = millis();
+  if (now - lastMsg > 10000) {
+    lastMsg = now;
+ //   Serial.println("pingo ogni 10 secondi");
+ // check if we are connected to main
+  bool ret = Ping.ping("192.168.5.40");
+  if(ret == false ){
+   online = false;
+    
+  }else if(ret == true){
+   online = true;
+  }
+      } // end timer
+
+      // se non pinghiamo, controlliamo quante volte e poi tiriamo un reset
+      if(online == false){
+        offlineCounter += 1;
+      }else if(online == true ){
+        offlineCounter = 0;
+      }
+      if(offlineCounter >= 4 ){
+        ESP.restart();
+      }
+}
 
 
   // leggiamo pressione acqua ogni secondo
@@ -146,7 +198,7 @@ void loop() {
       raw = analogRead(analogPin);
        Serial.print("Raw: ");
     Serial.println(raw);
-    valore = map(raw, 0, 4095, 0, 12);
+    valore = map(raw, 0, 2095, 0, 10);
   }
   
 }
