@@ -1,7 +1,7 @@
 /*
   MxIrrigation by MxSolutions.it
   Author: Nicola Deboni, Mx Solutions
-  Firmware version: 1.1.1
+  Firmware version: 1.1.2
 
   Description
   -----------
@@ -62,7 +62,7 @@
 #include <ESPping.h>
 #include <time.h>
 
-const char* FW_VERSION = "1.1.1";
+const char* FW_VERSION = "1.1.2";
 
 const char *ssid = "WMPSERVICE";
 const char *password = "motocross";
@@ -90,11 +90,6 @@ unsigned long pressureTimer;
 
 // status
 bool masterOn = false;
-
-#define VALVE1_A 23
-#define VALVE1_B 22
-#define closedPin 27
-#define openPin 26
 
 // ---- Web UI password (query string) ----
 #define ENABLE_WEB_PASSWORD 1
@@ -145,6 +140,7 @@ bool startBothPumps = false;
 bool useRelay4 = false;
 
 // Forward declarations
+static int median3(int a, int b, int c);
 String nowString();
 void clearPressureAlertLogs();
 bool isWebAuthorized();
@@ -153,6 +149,13 @@ void checkLowPressureTripWhilePumpsOn();
 void monitorPingAndRebootWhenPumpsOff();
 void runPumpSequencer();
 void handleRoot();
+
+static int median3(int a, int b, int c) {
+  if (a > b) { int t = a; a = b; b = t; }
+  if (b > c) { int t = b; b = c; c = t; }
+  if (a > b) { int t = a; a = b; b = t; }
+  return b; // median
+}
 
 String nowString() {
   struct tm timeinfo;
@@ -426,9 +429,6 @@ void setup() {
   pressureTimer = millis() + 1000;
   pinMode(analogPin, INPUT);
 
-  pinMode(closedPin, INPUT);
-  pinMode(openPin, INPUT);
-
   for (int i = 0; i < numRelays; i++) {
     pinMode(relayPins[i], OUTPUT);
   }
@@ -501,9 +501,6 @@ void setup() {
 
   server.begin();
   Serial.println("HTTP server started");
-
-  pinMode(VALVE1_A, OUTPUT);
-  pinMode(VALVE1_B, OUTPUT);
 }
 
 void loop() {
@@ -515,9 +512,10 @@ void loop() {
   if (millis() >= pressureTimer) {
     pressureTimer = millis() + 1000;
 
-    raw = analogRead(analogPin);
-    raw = analogRead(analogPin);
-    raw = analogRead(analogPin);
+    int r1 = analogRead(analogPin);
+    int r2 = analogRead(analogPin);
+    int r3 = analogRead(analogPin);
+    raw = median3(r1, r2, r3);
 
     Serial.print("Raw: ");
     Serial.println(raw);
