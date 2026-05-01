@@ -1,7 +1,7 @@
 /*
   MxIrrigation by MxSolutions.it
   Author: Nicola Deboni, Mx Solutions
-  Firmware version: 1.1.2
+  Firmware version: 1.1.4
 
   Description
   -----------
@@ -11,50 +11,14 @@
   - Pressure monitoring (high-pressure trip and low-pressure trip)
   - Network watchdog via ICMP ping (reboot after consecutive failures when pumps are off)
   - NTP time for timestamped alert logs displayed on the web root page
+  - /logs page: shows last 10 events since boot (pump ON/OFF, alerts, restarts, etc.)
+  - /pressure page: shows a simple cartesian graph (HTML5 canvas) of last hour pressure,
+    sampled once per second (3600 samples). Graph uses converted pressure (bar).
 
-  Function overview
-  -----------------
-  setup()
-    - Initializes serial, GPIO pins, relays (OFF), WiFi (static IP), NTP time, and HTTP routes.
-
-  loop()
-    - Handles HTTP clients, runs the pump sequencer, runs ping monitor when pumps are off,
-      reads pressure every second, and performs safety trips.
-
-  nowString()
-    - Returns current date/time as "YYYY-MM-DD HH:MM:SS" from NTP.
-      If NTP not set, returns an uptime-based string.
-
-  clearPressureAlertLogs()
-    - Clears alert HTML strings and resets pressure timing windows.
-      Called when pumps are started again so old alerts disappear from the UI.
-
-  isWebAuthorized()
-    - If password feature enabled, checks query string parameter `pw` against WEB_PASSWORD.
-      If disabled, always returns true.
-
-  checkHighPressureTrip()
-    - Safety trip: if raw pressure remains above RAW_LIMIT continuously for RAW_OVER_LIMIT_MS,
-      shuts down pumps and logs an alert to the web UI. Resets timing if pressure drops back.
-
-  checkLowPressureTripWhilePumpsOn()
-    - Safety trip: while pumps are ON (masterOn==true), if raw pressure remains below
-      RAW_MIN_LIMIT continuously for RAW_UNDER_LIMIT_MS, shuts down pumps and logs an alert.
-
-  monitorPingAndRebootWhenPumpsOff()
-    - Network watchdog: starts 60s after boot; while pumps are OFF, pings 192.168.5.40 every
-      20s. After 4 consecutive failures, reboots the ESP32.
-
-  runPumpSequencer()
-    - Non-blocking relay sequencing:
-        /master/on:       relay4 ON -> wait 5s -> master ON -> wait 2s -> pump1 ON -> wait 4s -> pump2 ON
-        /master-solar/on: master ON -> wait 2s -> pump1 ON -> wait 4s -> pump2 ON
-        /single:          master ON -> wait 2s -> pump1 ON only
-        /master/off:      ALL relays OFF immediately
-
-  handleRoot()
-    - Builds and serves the main HTML page with current status, pressure, and any alert logs.
-      If not authorized, hides control links.
+  Notes
+  -----
+  - Storing 3600 samples uses RAM. This implementation stores uint16_t pressure samples in
+    centibar (bar*100) (~7.2 KB). This avoids floats in the history buffer.
 */
 
 #include <WiFi.h>
@@ -62,7 +26,7 @@
 #include <ESPping.h>
 #include <time.h>
 
-const char* FW_VERSION = "1.1.2";
+const char* FW_VERSION = "1.1.4";
 
 const char *ssid = "WMPSERVICE";
 const char *password = "motocross";
@@ -85,7 +49,7 @@ bool counterFlag = false;
 // pressure sensor
 int analogPin = 36;
 int raw = 0;
-float valore = 0;
+float valore = 0; // current pressure in bar (but see mapping in loop)
 unsigned long pressureTimer;
 
 // status
@@ -109,6 +73,19 @@ unsigned long rawUnderStartMs = 0;
 // Alert logs shown on root page
 String pressureTripLog = "";
 String lowPressureTripLog = "";
+
+// ---- Last 10 events ring buffer (/logs) ----
+static const int EVENT_LOG_CAPACITY = 10;
+String eventLogs[EVENT_LOG_CAPACITY];
+int eventLogHead = 0;   // next write index
+int eventLogCount = 0;  // number of valid entries (<= capacity)
+
+// ---- Pressure history ring buffer: last hour @ 1 Hz (/pressure) ----
+// We store pressure in "centibar" (bar * 100) as integer to avoid floats in RAM/history.
+static const int PRESSURE_HISTORY_SECONDS = 3600;
+uint16_t pressureHistoryCb[PRESSURE_HISTORY_SECONDS];
+int pressureHistHead = 0;   // next write index
+int pressureHistCount = 0;  // number of valid samples (<= 3600)
 
 // ---- Non-blocking ping/reboot monitor ----
 const unsigned long PING_START_DELAY_MS = 60000;   // start 60s after boot
@@ -142,6 +119,9 @@ bool useRelay4 = false;
 // Forward declarations
 static int median3(int a, int b, int c);
 String nowString();
+void addEventLog(const String& msg);
+void addPressureSampleCentibar(uint16_t centibar);
+uint16_t rawToCentibar(int rawValue);
 void clearPressureAlertLogs();
 bool isWebAuthorized();
 void checkHighPressureTrip();
@@ -149,6 +129,8 @@ void checkLowPressureTripWhilePumpsOn();
 void monitorPingAndRebootWhenPumpsOff();
 void runPumpSequencer();
 void handleRoot();
+void handleLogs();
+void handlePressure();
 
 static int median3(int a, int b, int c) {
   if (a > b) { int t = a; a = b; b = t; }
@@ -165,6 +147,30 @@ String nowString() {
   char buf[32];
   strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &timeinfo);
   return String(buf);
+}
+
+void addEventLog(const String& msg) {
+  eventLogs[eventLogHead] = nowString() + " - " + msg;
+  eventLogHead = (eventLogHead + 1) % EVENT_LOG_CAPACITY;
+  if (eventLogCount < EVENT_LOG_CAPACITY) eventLogCount++;
+}
+
+void addPressureSampleCentibar(uint16_t centibar) {
+  pressureHistoryCb[pressureHistHead] = centibar;
+  pressureHistHead = (pressureHistHead + 1) % PRESSURE_HISTORY_SECONDS;
+  if (pressureHistCount < PRESSURE_HISTORY_SECONDS) pressureHistCount++;
+}
+
+// Convert raw ADC to centibar (bar*100).
+// Current project mapping (kept consistent with previous map(raw, 0, 2095, 0, 10)):
+//   raw=0   -> 0.00 bar
+//   raw=2095-> 10.00 bar
+uint16_t rawToCentibar(int rawValue) {
+  if (rawValue <= 0) return 0;
+  if (rawValue >= 2095) return 1000; // 10.00 bar
+  // centibar = raw * (1000 / 2095)
+  // Use integer math with rounding:
+  return (uint16_t)((rawValue * 1000L + (2095 / 2)) / 2095);
 }
 
 void clearPressureAlertLogs() {
@@ -202,6 +208,8 @@ void checkHighPressureTrip() {
       pressureTripLog += "Raw: " + String(raw) + " (limit " + String(RAW_LIMIT) + ")<br>";
       pressureTripLog += "</div>";
 
+      addEventLog("ALERT: High pressure trip, pumps shut off (raw=" + String(raw) + ")");
+
       Serial.println("ALERT: High pressure trip. Pumps shut off. raw=" + String(raw));
     }
   } else {
@@ -232,6 +240,8 @@ void checkLowPressureTripWhilePumpsOn() {
       lowPressureTripLog += "Time: " + nowString() + "<br>";
       lowPressureTripLog += "Raw: " + String(raw) + " (min " + String(RAW_MIN_LIMIT) + ")<br>";
       lowPressureTripLog += "</div>";
+
+      addEventLog("ALERT: Low pressure trip, pumps shut off (raw=" + String(raw) + ")");
 
       Serial.println("ALERT: Low pressure trip. Pumps shut off. raw=" + String(raw));
     }
@@ -265,6 +275,7 @@ void monitorPingAndRebootWhenPumpsOff() {
   }
 
   if (pingFailCount >= PING_FAIL_REBOOT_COUNT) {
+    addEventLog("RESTART: ping failed " + String(PING_FAIL_REBOOT_COUNT) + " times (pumps off)");
     Serial.println("RESTART: ping failed 4 times (pumps off)");
     ESP.restart();
   }
@@ -283,6 +294,8 @@ void runPumpSequencer() {
 
     startBothPumps = false;
     useRelay4 = false;
+
+    addEventLog("PUMPS OFF (stop requested)");
   }
 
   // Start requests
@@ -295,6 +308,8 @@ void runPumpSequencer() {
     pumpSeqMs = now;
 
     pendingMasterStart = false;
+
+    addEventLog("START: master/on requested (relay4 ON, sequencing both pumps)");
   }
 
   if (pendingMasterSolarStart && pumpSeqState == PSEQ_IDLE) {
@@ -309,6 +324,8 @@ void runPumpSequencer() {
     pumpSeqMs = now;
 
     pendingMasterSolarStart = false;
+
+    addEventLog("START: master-solar/on requested (master ON, sequencing both pumps)");
   }
 
   if (pendingSingleStart && pumpSeqState == PSEQ_IDLE) {
@@ -323,6 +340,8 @@ void runPumpSequencer() {
     pumpSeqMs = now;
 
     pendingSingleStart = false;
+
+    addEventLog("START: single requested (master ON, pump1 only)");
   }
 
   // State progression
@@ -337,12 +356,15 @@ void runPumpSequencer() {
 
         pumpSeqState = PSEQ_START_WAIT2S;
         pumpSeqMs = now;
+
+        addEventLog("SEQ: master ON (after relay4 wait 5s)");
       }
       break;
 
     case PSEQ_START_WAIT2S:
       if (now - pumpSeqMs >= 2000) {
         digitalWrite(relayPins[1], HIGH); // pump1
+        addEventLog("SEQ: pump1 ON");
 
         if (startBothPumps) {
           pumpSeqState = PSEQ_START_PUMP1_ON_WAIT4S;
@@ -350,6 +372,7 @@ void runPumpSequencer() {
         } else {
           digitalWrite(relayPins[2], LOW); // ensure pump2 stays off
           pumpSeqState = PSEQ_IDLE;
+          addEventLog("SEQ: single mode complete (pump2 OFF, idle)");
         }
       }
       break;
@@ -358,6 +381,7 @@ void runPumpSequencer() {
       if (now - pumpSeqMs >= 4000) {
         digitalWrite(relayPins[2], HIGH); // pump2
         pumpSeqState = PSEQ_IDLE;
+        addEventLog("SEQ: pump2 ON (sequence complete, idle)");
       }
       break;
 
@@ -386,6 +410,9 @@ void handleRoot() {
   roothtml += " | bar ";
   roothtml += valore;
 
+  roothtml += "<br><br><a href=/logs>View logs</a>";
+  roothtml += "<br><a href=/pressure>View pressure (last hour)</a>";
+
   if (authorized) {
 #if ENABLE_WEB_PASSWORD
     String pwq = String("?") + WEB_PW_PARAM + "=" + WEB_PASSWORD;
@@ -409,13 +436,145 @@ void handleRoot() {
   server.send(200, "text/html", roothtml);
 }
 
+void handleLogs() {
+  String html;
+  html += "<!DOCTYPE HTML><html><head>";
+  html += "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" /> ";
+  html += "<META HTTP-EQUIV=\"CACHE-CONTROL\" CONTENT=\"NO-CACHE\">";
+  html += "<meta http-equiv=\"Expires\" content=\"0\">";
+  html += "<title>MxIrrigation - Logs</title></head><body>";
+  html += "<div align=center>";
+  html += "<h2>MxIrrigation - Event Logs (last 10 since boot)</h2>";
+  html += "<div style='margin-bottom:10px;'><a href='/'>Back</a></div>";
+
+  html += "<table border='1' cellpadding='6' cellspacing='0' style='border-collapse:collapse;text-align:left;'>";
+  html += "<tr><th>#</th><th>Event</th></tr>";
+
+  if (eventLogCount == 0) {
+    html += "<tr><td colspan='2'><i>No events yet</i></td></tr>";
+  } else {
+    int start = (eventLogHead - eventLogCount);
+    while (start < 0) start += EVENT_LOG_CAPACITY;
+
+    for (int i = 0; i < eventLogCount; i++) {
+      int idx = (start + i) % EVENT_LOG_CAPACITY;
+      html += "<tr><td>";
+      html += String(i + 1);
+      html += "</td><td><pre style='margin:0;white-space:pre-wrap;'>";
+      html += eventLogs[idx];
+      html += "</pre></td></tr>";
+    }
+  }
+
+  html += "</table>";
+  html += "</div></body></html>";
+
+  server.send(200, "text/html", html);
+}
+
+void handlePressure() {
+  // Convert centibar -> bar in JS with /100.0
+  String html;
+  html += "<!DOCTYPE HTML><html><head>";
+  html += "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" /> ";
+  html += "<META HTTP-EQUIV=\"CACHE-CONTROL\" CONTENT=\"NO-CACHE\">";
+  html += "<meta http-equiv=\"Expires\" content=\"0\">";
+  html += "<title>MxIrrigation - Pressure</title>";
+  html += "<style>body{font-family:Arial;} canvas{border:1px solid #444;}</style>";
+  html += "</head><body>";
+  html += "<div align=center>";
+  html += "<h2>Pressure (bar) - Last hour (1 sample/sec)</h2>";
+  html += "<div style='margin-bottom:10px;'><a href='/'>Back</a></div>";
+
+  uint16_t curCb = rawToCentibar(raw);
+  float curBar = curCb / 100.0f;
+  html += "<div>Now: " + nowString() + " | current: " + String(curBar, 2) + " bar</div><br>";
+
+  html += "<canvas id='c' width='1000' height='300'></canvas>";
+
+  html += "<script>\n";
+  html += "const samplesCb=[";
+  if (pressureHistCount > 0) {
+    int start = (pressureHistHead - pressureHistCount);
+    while (start < 0) start += PRESSURE_HISTORY_SECONDS;
+    for (int i = 0; i < pressureHistCount; i++) {
+      int idx = (start + i) % PRESSURE_HISTORY_SECONDS;
+      html += String((unsigned int)pressureHistoryCb[idx]);
+      if (i != pressureHistCount - 1) html += ",";
+    }
+  }
+  html += "];\n";
+
+  html += R"JS(
+const samples = samplesCb.map(v => v/100.0); // bar
+const canvas=document.getElementById('c');
+const ctx=canvas.getContext('2d');
+const W=canvas.width, H=canvas.height;
+
+function draw(){
+  ctx.clearRect(0,0,W,H);
+
+  ctx.strokeStyle='#444';
+  ctx.strokeRect(0.5,0.5,W-1,H-1);
+
+  if(samples.length<2){
+    ctx.fillStyle='#666';
+    ctx.fillText('Not enough samples yet', 10, 20);
+    return;
+  }
+
+  let min=Number.POSITIVE_INFINITY, max=Number.NEGATIVE_INFINITY;
+  for(const v of samples){ if(v<min)min=v; if(v>max)max=v; }
+  if(min===max){ min-=0.01; max+=0.01; }
+
+  const padL=50, padR=10, padT=10, padB=25;
+  const plotW=W-padL-padR, plotH=H-padT-padB;
+
+  // axes
+  ctx.strokeStyle='#999';
+  ctx.beginPath();
+  ctx.moveTo(padL, padT);
+  ctx.lineTo(padL, padT+plotH);
+  ctx.lineTo(padL+plotW, padT+plotH);
+  ctx.stroke();
+
+  // y labels
+  ctx.fillStyle='#333';
+  ctx.font='12px Arial';
+  ctx.fillText(max.toFixed(2)+' bar', 5, padT+10);
+  ctx.fillText(min.toFixed(2)+' bar', 5, padT+plotH);
+
+  // x labels
+  ctx.fillText('60 min ago', padL, H-5);
+  ctx.fillText('now', padL+plotW-25, H-5);
+
+  // polyline
+  ctx.strokeStyle='#0a6';
+  ctx.lineWidth=1;
+  ctx.beginPath();
+  for(let i=0;i<samples.length;i++){
+    const x=padL + (i/(samples.length-1))*plotW;
+    const y=padT + (1 - (samples[i]-min)/(max-min))*plotH;
+    if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+  }
+  ctx.stroke();
+}
+draw();
+)JS";
+
+  html += "\n</script>";
+  html += "</div></body></html>";
+
+  server.send(200, "text/html", html);
+}
+
 void setup() {
   pinMode(ledPin, OUTPUT);
   digitalWrite(ledPin, LOW);
 
   Serial.begin(115200);
   while (!Serial) delay(1);
-  Serial.println("\n            Generator Admin by MxSolutions.it");
+  Serial.println("\n           MxIrrigation by MxSolutions.it");
   Serial.println("                  www.mxsolutions.it");
   Serial.println("                 All Rights Reserved");
   Serial.print("                 Versione firmware: ");
@@ -437,6 +596,10 @@ void setup() {
     digitalWrite(relayPins[i], LOW);
   }
 
+  for (int i = 0; i < PRESSURE_HISTORY_SECONDS; i++) pressureHistoryCb[i] = 0;
+  pressureHistHead = 0;
+  pressureHistCount = 0;
+
   WiFi.config(staticIP, gateway, subnet);
   WiFi.begin(ssid, password);
 
@@ -449,6 +612,7 @@ void setup() {
     } else {
       currentMillis = millis();
       if (currentMillis - startMillis >= period) {
+        addEventLog("RESTART: wifi connect timeout");
         Serial.println("RESTART: wifi connect timeout");
         ESP.restart();
       }
@@ -462,7 +626,11 @@ void setup() {
 
   configTime(0, 0, "pool.ntp.org", "time.nist.gov");
 
+  addEventLog("BOOT: firmware " + String(FW_VERSION) + " started, IP " + WiFi.localIP().toString());
+
   server.on("/", handleRoot);
+  server.on("/logs", handleLogs);
+  server.on("/pressure", handlePressure);
 
   server.on("/master/on", HTTP_GET, []() {
     clearPressureAlertLogs();
@@ -517,10 +685,14 @@ void loop() {
     int r3 = analogRead(analogPin);
     raw = median3(r1, r2, r3);
 
+    uint16_t cb = rawToCentibar(raw);
+    addPressureSampleCentibar(cb);
+
     Serial.print("Raw: ");
     Serial.println(raw);
 
-    valore = map(raw, 0, 2095, 0, 10);
+    // Keep existing "bar" display behavior but with float (better than integer map)
+    valore = cb / 100.0f;
 
     checkHighPressureTrip();
     checkLowPressureTripWhilePumpsOn();
