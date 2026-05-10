@@ -33,15 +33,15 @@
 #include "esp_bt.h"
 
 // ----------------- USER CONFIG -----------------
-const char* WIFI_SSID     = "WMPHOUSE";
+const char* WIFI_SSID     = "WAFNAMOTOPARK";
 const char* WIFI_PASSWORD = "motocross";
 
-IPAddress localIP(192, 168, 5, 48);
+IPAddress localIP(192, 168, 5, 45);
 IPAddress gateway(192, 168, 5, 1);
 IPAddress subnet(255, 255, 255, 0);
 IPAddress dns1(192, 168, 5, 1);
 
-const uint32_t RELAY_PULSE_MS = 15000UL;
+const uint32_t RELAY_PULSE_MS = 20000UL;
 
 // Ping every minute only when status is OFF
 const uint32_t PING_PERIOD_MS = 60000UL;
@@ -120,7 +120,7 @@ void handleRoot() {
   page += F("<!doctype html><html><head><meta charset='utf-8'>");
   page += F("<meta name='viewport' content='width=device-width, initial-scale=1'>");
   page += F("<title>MxIrrigation</title></head><body>");
-  page += F("<h2>MxIrrigation T Valve Controller</h2>");
+  page += F("<h2>MxIrrigation T Valve Controller ANFITEATRO</h2>");
 
   page += F("<p><b>Status:</b> ");
   page += statusToString(nodeStatus);
