@@ -1,7 +1,7 @@
 /*
   MxIrrigation by MxSolutions.it
   Author: Nicola Deboni, Mx Solutions
-  Firmware version: 1.1.4
+  Firmware version: 1.1.5
 
   Description
   -----------
@@ -26,7 +26,7 @@
 #include <ESPping.h>
 #include <time.h>
 
-const char* FW_VERSION = "1.1.4";
+const char* FW_VERSION = "1.1.5";
 
 const char *ssid = "WMPSERVICE";
 const char *password = "motocross";
@@ -49,7 +49,7 @@ bool counterFlag = false;
 // pressure sensor
 int analogPin = 36;
 int raw = 0;
-float valore = 0; // current pressure in bar (but see mapping in loop)
+float valore = 0; // current pressure in bar
 unsigned long pressureTimer;
 
 // status
@@ -161,15 +161,9 @@ void addPressureSampleCentibar(uint16_t centibar) {
   if (pressureHistCount < PRESSURE_HISTORY_SECONDS) pressureHistCount++;
 }
 
-// Convert raw ADC to centibar (bar*100).
-// Current project mapping (kept consistent with previous map(raw, 0, 2095, 0, 10)):
-//   raw=0   -> 0.00 bar
-//   raw=2095-> 10.00 bar
 uint16_t rawToCentibar(int rawValue) {
   if (rawValue <= 0) return 0;
   if (rawValue >= 2095) return 1000; // 10.00 bar
-  // centibar = raw * (1000 / 2095)
-  // Use integer math with rounding:
   return (uint16_t)((rawValue * 1000L + (2095 / 2)) / 2095);
 }
 
@@ -394,6 +388,15 @@ void runPumpSequencer() {
 void handleRoot() {
   bool authorized = isWebAuthorized();
 
+  // WiFi info
+  String wifiState = (WiFi.status() == WL_CONNECTED) ? "CONNECTED" : "DISCONNECTED";
+  String wifiIP = WiFi.localIP().toString();
+  String wifiGW = WiFi.gatewayIP().toString();
+  String wifiMask = WiFi.subnetMask().toString();
+  String wifiSSID = WiFi.SSID();
+  int wifiRSSI = WiFi.RSSI(); // dBm (typically -30 .. -90)
+  String wifiMAC = WiFi.macAddress();
+
   String roothtml;
   roothtml += "<!DOCTYPE HTML>";
   roothtml += "<html><head>";
@@ -401,9 +404,29 @@ void handleRoot() {
   roothtml += "<META HTTP-EQUIV=\"CACHE-CONTROL\" CONTENT=\"NO-CACHE\">";
   roothtml += "<meta http-equiv=\"Expires\" content=\"0\">";
   roothtml += "<title>MxIrrigation - Pump control</title></head><body>";
-  roothtml += "<div align=center>Stato pompe:";
+  roothtml += "<div align=center>";
+
+  roothtml += "<h2>MxIrrigation</h2>";
+  roothtml += "<div>FW: ";
+  roothtml += FW_VERSION;
+  roothtml += "</div>";
+
+  roothtml += "<hr style='max-width:900px;'>";
+
+  roothtml += "<b>WiFi</b><br>";
+  roothtml += "Status: " + wifiState + "<br>";
+  roothtml += "SSID: " + wifiSSID + "<br>";
+  roothtml += "RSSI: " + String(wifiRSSI) + " dBm<br>";
+  roothtml += "IP: " + wifiIP + "<br>";
+  roothtml += "Gateway: " + wifiGW + "<br>";
+  roothtml += "Subnet: " + wifiMask + "<br>";
+  roothtml += "MAC: " + wifiMAC + "<br>";
+
+  roothtml += "<hr style='max-width:900px;'>";
+
+  roothtml += "Stato pompe:";
   if (masterOn) roothtml += " <font color=red>ACCESE</font>";
-  else          roothtml += "<font color=green>SPENTE</font>";
+  else          roothtml += " <font color=green>SPENTE</font>";
 
   roothtml += "<br><br>Pressione: raw ";
   roothtml += raw;
@@ -436,6 +459,7 @@ void handleRoot() {
   server.send(200, "text/html", roothtml);
 }
 
+// ---- /logs ----
 void handleLogs() {
   String html;
   html += "<!DOCTYPE HTML><html><head>";
@@ -472,8 +496,8 @@ void handleLogs() {
   server.send(200, "text/html", html);
 }
 
+// ---- /pressure ----
 void handlePressure() {
-  // Convert centibar -> bar in JS with /100.0
   String html;
   html += "<!DOCTYPE HTML><html><head>";
   html += "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" /> ";
@@ -527,7 +551,7 @@ function draw(){
   for(const v of samples){ if(v<min)min=v; if(v>max)max=v; }
   if(min===max){ min-=0.01; max+=0.01; }
 
-  const padL=50, padR=10, padT=10, padB=25;
+  const padL=60, padR=10, padT=10, padB=25;
   const plotW=W-padL-padR, plotH=H-padT-padB;
 
   // axes
@@ -574,7 +598,7 @@ void setup() {
 
   Serial.begin(115200);
   while (!Serial) delay(1);
-  Serial.println("\n           MxIrrigation by MxSolutions.it");
+  Serial.println("\n            Generator Admin by MxSolutions.it");
   Serial.println("                  www.mxsolutions.it");
   Serial.println("                 All Rights Reserved");
   Serial.print("                 Versione firmware: ");
@@ -691,7 +715,6 @@ void loop() {
     Serial.print("Raw: ");
     Serial.println(raw);
 
-    // Keep existing "bar" display behavior but with float (better than integer map)
     valore = cb / 100.0f;
 
     checkHighPressureTrip();

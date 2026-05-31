@@ -6,7 +6,7 @@
 
 const char* FW_VERSION = "1000";
 
-const char *ssid = "WAFNAMOTOPARK";  
+const char *ssid = "WMPHOUSE";  
 const char *password = "motocross";
 
 const char* ntpServer1 = "pool.ntp.org";
@@ -18,7 +18,7 @@ const char* time_zone = "CET-1CEST,M3.5.0,M10.5.0/3";  // TimeZone rule for Euro
 
 int valveDelay = 400;
 
-IPAddress staticIP(192, 168, 5, 42); // static IP address
+IPAddress staticIP(192, 168, 5, 44); // static IP address
 IPAddress gateway(192, 168, 5, 1);    // network's gateway address
 IPAddress subnet(255, 255, 255, 0);   // network's subnet mask
 
