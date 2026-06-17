@@ -1,7 +1,7 @@
 /*
   MxIrrigation by MxSolutions.it
   Author: Nicola Deboni, Mx Solutions
-  Firmware version: 1.1.5
+  Firmware version: 1.2.0
 
   Description
   -----------
@@ -19,6 +19,7 @@
   -----
   - Storing 3600 samples uses RAM. This implementation stores uint16_t pressure samples in
     centibar (bar*100) (~7.2 KB). This avoids floats in the history buffer.
+  - Uptime month formatting is approximate and uses 30-day months.
 */
 
 #include <WiFi.h>
@@ -26,7 +27,7 @@
 #include <ESPping.h>
 #include <time.h>
 
-const char* FW_VERSION = "1.1.5";
+const char* FW_VERSION = "1.2.0";
 
 const char *ssid = "WMPSERVICE";
 const char *password = "motocross";
@@ -41,11 +42,6 @@ const int relayPins[] = {21, 19, 18, 5};
 const int numRelays = sizeof(relayPins) / sizeof(relayPins[0]);
 const int ledPin = 25;
 
-unsigned long startMillis;
-unsigned long currentMillis;
-const unsigned long period = 30000;
-bool counterFlag = false;
-
 // pressure sensor
 int analogPin = 36;
 int raw = 0;
@@ -59,6 +55,11 @@ bool masterOn = false;
 #define ENABLE_WEB_PASSWORD 1
 const char* WEB_PASSWORD = "1234";   // <-- change this
 const char* WEB_PW_PARAM = "pw";     // URL: /?pw=1234
+
+// ---- Timezone / NTP ----
+const char* TZ_INFO = "CET-1CEST,M3.5.0/2,M10.5.0/3"; // Italy local time with DST
+const unsigned long NTP_RETRY_PERIOD_MS = 60000;
+unsigned long lastNtpSyncAttemptMs = 0;
 
 // ---- High/Low pressure shutdown settings/state ----
 const int RAW_LIMIT = 2000;
@@ -87,43 +88,64 @@ uint16_t pressureHistoryCb[PRESSURE_HISTORY_SECONDS];
 int pressureHistHead = 0;   // next write index
 int pressureHistCount = 0;  // number of valid samples (<= 3600)
 
+// ---- WiFi reconnect monitor ----
+const unsigned long WIFI_CONNECT_TIMEOUT_MS = 30000;
+const unsigned long WIFI_RECONNECT_PERIOD_MS = 10000;
+unsigned long wifiConnectAttemptStartMs = 0;
+unsigned long lastWiFiReconnectAttemptMs = 0;
+bool wifiConnecting = false;
+
 // ---- Non-blocking ping/reboot monitor ----
-const unsigned long PING_START_DELAY_MS = 60000;   // start 60s after boot
-const unsigned long PING_PERIOD_MS      = 20000;   // every 20s when pumps off
-const int PING_FAIL_REBOOT_COUNT        = 4;
+const unsigned long PING_START_DELAY_MS = 120000;   // start 120s after boot
+const unsigned long PING_PERIOD_MS      = 30000;    // every 30s when pumps off
+const int PING_FAIL_REBOOT_COUNT        = 8;
+const unsigned long PING_REBOOT_COOLDOWN_MS = 300000; // 5 minutes
 
 unsigned long bootMs = 0;
 unsigned long lastPingMs = 0;
 int pingFailCount = 0;
+unsigned long lastPingTriggeredRestartMs = 0;
 
 // ---- Non-blocking pump sequencer ----
 enum PumpSequenceState {
   PSEQ_IDLE = 0,
   PSEQ_RELAY4_WAIT5S,
-  PSEQ_START_WAIT2S,
-  PSEQ_START_PUMP1_ON_WAIT4S,
-  PSEQ_STOP_WAIT500MS
+  PSEQ_MASTER_WAIT2S,
+  PSEQ_PUMP1_WAIT4S,
+  PSEQ_ALT_WAIT5S,
+  PSEQ_ALT_PUMP2_HOLD40S
+};
+
+enum StartMode {
+  START_NONE = 0,
+  START_MASTER_BOTH,
+  START_MASTER_SOLAR_BOTH,
+  START_SINGLE_ONLY,
+  START_STAGGERED_AUTO_OFF
 };
 
 PumpSequenceState pumpSeqState = PSEQ_IDLE;
 unsigned long pumpSeqMs = 0;
-
-bool pendingMasterStart = false;
-bool pendingMasterSolarStart = false;
-bool pendingSingleStart = false;
+StartMode pendingStartMode = START_NONE;
 bool pendingStop = false;
-
-bool startBothPumps = false;
-bool useRelay4 = false;
 
 // Forward declarations
 static int median3(int a, int b, int c);
 String nowString();
+String formatUptime(unsigned long uptimeMs);
+String htmlEscape(const String& s);
 void addEventLog(const String& msg);
 void addPressureSampleCentibar(uint16_t centibar);
 uint16_t rawToCentibar(int rawValue);
 void clearPressureAlertLogs();
 bool isWebAuthorized();
+bool ensureAuthorized();
+void stopAllPumps(const String& reason);
+void queueStartMode(StartMode mode, const String& actionLabel);
+void setupWiFi();
+void ensureWiFiConnected();
+void configureLocalTime();
+void ensureTimeConfigured();
 void checkHighPressureTrip();
 void checkLowPressureTripWhilePumpsOn();
 void monitorPingAndRebootWhenPumpsOff();
@@ -131,6 +153,7 @@ void runPumpSequencer();
 void handleRoot();
 void handleLogs();
 void handlePressure();
+void handleReboot();
 
 static int median3(int a, int b, int c) {
   if (a > b) { int t = a; a = b; b = t; }
@@ -139,14 +162,51 @@ static int median3(int a, int b, int c) {
   return b; // median
 }
 
+String formatUptime(unsigned long uptimeMs) {
+  unsigned long totalSeconds = uptimeMs / 1000UL;
+  unsigned long seconds = totalSeconds % 60UL;
+  unsigned long totalMinutes = totalSeconds / 60UL;
+  unsigned long minutes = totalMinutes % 60UL;
+  unsigned long totalHours = totalMinutes / 60UL;
+  unsigned long hours = totalHours % 24UL;
+  unsigned long totalDays = totalHours / 24UL;
+  unsigned long months = totalDays / 30UL; // approximate months
+  unsigned long days = totalDays % 30UL;
+
+  String out;
+  if (months > 0) out += String(months) + " month" + (months == 1 ? "" : "s") + " ";
+  out += String(days) + " day" + (days == 1 ? "" : "s") + " ";
+  out += String(hours) + "h ";
+  out += String(minutes) + "m ";
+  out += String(seconds) + "s";
+  return out;
+}
+
 String nowString() {
   struct tm timeinfo;
   if (!getLocalTime(&timeinfo)) {
-    return "NTP not set (uptime " + String(millis() / 1000) + "s)";
+    return "NTP not set (uptime " + formatUptime(millis()) + ")";
   }
   char buf[32];
   strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &timeinfo);
   return String(buf);
+}
+
+String htmlEscape(const String& s) {
+  String out;
+  out.reserve(s.length() + 16);
+  for (size_t i = 0; i < s.length(); i++) {
+    char c = s[i];
+    switch (c) {
+      case '&': out += "&amp;"; break;
+      case '<': out += "&lt;"; break;
+      case '>': out += "&gt;"; break;
+      case '"': out += "&quot;"; break;
+      case '\'': out += "&#39;"; break;
+      default: out += c; break;
+    }
+  }
+  return out;
 }
 
 void addEventLog(const String& msg) {
@@ -183,6 +243,90 @@ bool isWebAuthorized() {
 #endif
 }
 
+bool ensureAuthorized() {
+  if (isWebAuthorized()) return true;
+  server.send(403, "text/plain", "Forbidden");
+  return false;
+}
+
+void stopAllPumps(const String& reason) {
+  for (int i = 0; i < numRelays; i++) digitalWrite(relayPins[i], LOW);
+  masterOn = false;
+  pumpSeqState = PSEQ_IDLE;
+  pendingStartMode = START_NONE;
+  pendingStop = false;
+  addEventLog(reason);
+}
+
+void queueStartMode(StartMode mode, const String& actionLabel) {
+  clearPressureAlertLogs();
+  pendingStartMode = mode;
+  pendingStop = false;
+  addEventLog("REQUEST: " + actionLabel);
+}
+
+void configureLocalTime() {
+  setenv("TZ", TZ_INFO, 1);
+  tzset();
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+  lastNtpSyncAttemptMs = millis();
+}
+
+void ensureTimeConfigured() {
+  struct tm timeinfo;
+  if (getLocalTime(&timeinfo, 100)) return;
+
+  unsigned long now = millis();
+  if (lastNtpSyncAttemptMs == 0 || now - lastNtpSyncAttemptMs >= NTP_RETRY_PERIOD_MS) {
+    Serial.println("NTP retry");
+    configureLocalTime();
+  }
+}
+
+void setupWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  WiFi.persistent(false);
+  WiFi.config(staticIP, gateway, subnet);
+  WiFi.begin(ssid, password);
+  wifiConnecting = true;
+  wifiConnectAttemptStartMs = millis();
+  lastWiFiReconnectAttemptMs = millis();
+}
+
+void ensureWiFiConnected() {
+  wl_status_t status = WiFi.status();
+  unsigned long now = millis();
+
+  if (status == WL_CONNECTED) {
+    if (wifiConnecting) {
+      wifiConnecting = false;
+      addEventLog("WIFI: connected, IP " + WiFi.localIP().toString());
+      Serial.println("Connected to WiFi");
+      Serial.print("IP address: ");
+      Serial.println(WiFi.localIP());
+    }
+    return;
+  }
+
+  if (!wifiConnecting) {
+    wifiConnecting = true;
+    wifiConnectAttemptStartMs = now;
+  }
+
+  if (now - lastWiFiReconnectAttemptMs >= WIFI_RECONNECT_PERIOD_MS) {
+    lastWiFiReconnectAttemptMs = now;
+    Serial.println("WIFI: reconnect attempt");
+    WiFi.disconnect(false, false);
+    WiFi.begin(ssid, password);
+  }
+
+  if (wifiConnecting && now - wifiConnectAttemptStartMs >= WIFI_CONNECT_TIMEOUT_MS) {
+    addEventLog("WIFI: still disconnected after reconnect timeout, keeping controller running");
+    wifiConnectAttemptStartMs = now;
+  }
+}
+
 void checkHighPressureTrip() {
   if (raw > RAW_LIMIT) {
     if (rawOverStartMs == 0) {
@@ -191,9 +335,7 @@ void checkHighPressureTrip() {
     }
 
     if (millis() - rawOverStartMs >= RAW_OVER_LIMIT_MS) {
-      for (int i = 0; i < numRelays; i++) digitalWrite(relayPins[i], LOW);
-      masterOn = false;
-
+      stopAllPumps("ALERT: High pressure trip, pumps shut off (raw=" + String(raw) + ")");
       rawOverStartMs = 0;
 
       pressureTripLog  = "<div style='margin-top:20px;padding:10px;border:2px solid red;color:red;'>";
@@ -201,8 +343,6 @@ void checkHighPressureTrip() {
       pressureTripLog += "Time: " + nowString() + "<br>";
       pressureTripLog += "Raw: " + String(raw) + " (limit " + String(RAW_LIMIT) + ")<br>";
       pressureTripLog += "</div>";
-
-      addEventLog("ALERT: High pressure trip, pumps shut off (raw=" + String(raw) + ")");
 
       Serial.println("ALERT: High pressure trip. Pumps shut off. raw=" + String(raw));
     }
@@ -224,9 +364,7 @@ void checkLowPressureTripWhilePumpsOn() {
     }
 
     if (millis() - rawUnderStartMs >= RAW_UNDER_LIMIT_MS) {
-      for (int i = 0; i < numRelays; i++) digitalWrite(relayPins[i], LOW);
-      masterOn = false;
-
+      stopAllPumps("ALERT: Low pressure trip, pumps shut off (raw=" + String(raw) + ")");
       rawUnderStartMs = 0;
 
       lowPressureTripLog  = "<div style='margin-top:20px;padding:10px;border:2px solid orange;color:orange;'>";
@@ -234,8 +372,6 @@ void checkLowPressureTripWhilePumpsOn() {
       lowPressureTripLog += "Time: " + nowString() + "<br>";
       lowPressureTripLog += "Raw: " + String(raw) + " (min " + String(RAW_MIN_LIMIT) + ")<br>";
       lowPressureTripLog += "</div>";
-
-      addEventLog("ALERT: Low pressure trip, pumps shut off (raw=" + String(raw) + ")");
 
       Serial.println("ALERT: Low pressure trip. Pumps shut off. raw=" + String(raw));
     }
@@ -251,10 +387,14 @@ void monitorPingAndRebootWhenPumpsOff() {
     return;
   }
 
+  if (WiFi.status() != WL_CONNECTED) {
+    pingFailCount = 0;
+    return;
+  }
+
   unsigned long now = millis();
 
   if (now - bootMs < PING_START_DELAY_MS) return;
-
   if (lastPingMs != 0 && (now - lastPingMs < PING_PERIOD_MS)) return;
   lastPingMs = now;
 
@@ -269,8 +409,16 @@ void monitorPingAndRebootWhenPumpsOff() {
   }
 
   if (pingFailCount >= PING_FAIL_REBOOT_COUNT) {
+    if (lastPingTriggeredRestartMs != 0 && (now - lastPingTriggeredRestartMs < PING_REBOOT_COOLDOWN_MS)) {
+      addEventLog("WATCHDOG: ping failures detected, reboot suppressed by cooldown");
+      pingFailCount = 0;
+      return;
+    }
+
     addEventLog("RESTART: ping failed " + String(PING_FAIL_REBOOT_COUNT) + " times (pumps off)");
-    Serial.println("RESTART: ping failed 4 times (pumps off)");
+    Serial.println("RESTART: ping failed repeatedly (pumps off)");
+    lastPingTriggeredRestartMs = now;
+    delay(100);
     ESP.restart();
   }
 }
@@ -278,109 +426,117 @@ void monitorPingAndRebootWhenPumpsOff() {
 void runPumpSequencer() {
   unsigned long now = millis();
 
-  // Stop request has priority
-  if (pendingStop && pumpSeqState == PSEQ_IDLE) {
-    for (int i = 0; i < numRelays; i++) digitalWrite(relayPins[i], LOW);
-    masterOn = false;
-
-    pumpSeqState = PSEQ_IDLE;
-    pendingStop = false;
-
-    startBothPumps = false;
-    useRelay4 = false;
-
-    addEventLog("PUMPS OFF (stop requested)");
+  if (pendingStop) {
+    stopAllPumps("PUMPS OFF (stop requested)");
+    return;
   }
 
-  // Start requests
-  if (pendingMasterStart && pumpSeqState == PSEQ_IDLE) {
-    useRelay4 = true;
-    startBothPumps = true;
+  if (pumpSeqState == PSEQ_IDLE && pendingStartMode != START_NONE) {
+    StartMode mode = pendingStartMode;
+    pendingStartMode = START_NONE;
 
-    digitalWrite(relayPins[3], HIGH); // relay 4 ON first
-    pumpSeqState = PSEQ_RELAY4_WAIT5S;
-    pumpSeqMs = now;
+    switch (mode) {
+      case START_MASTER_BOTH:
+        digitalWrite(relayPins[3], HIGH);
+        pumpSeqState = PSEQ_RELAY4_WAIT5S;
+        pumpSeqMs = now;
+        addEventLog("START: master/on requested (relay4 ON, sequencing both pumps)");
+        break;
 
-    pendingMasterStart = false;
+      case START_MASTER_SOLAR_BOTH:
+        digitalWrite(relayPins[3], LOW);
+        digitalWrite(relayPins[0], HIGH);
+        masterOn = true;
+        pumpSeqState = PSEQ_MASTER_WAIT2S;
+        pumpSeqMs = now;
+        addEventLog("START: master-solar/on requested (master ON, sequencing both pumps)");
+        break;
 
-    addEventLog("START: master/on requested (relay4 ON, sequencing both pumps)");
+      case START_SINGLE_ONLY:
+        digitalWrite(relayPins[3], LOW);
+        digitalWrite(relayPins[0], HIGH);
+        masterOn = true;
+        pumpSeqState = PSEQ_MASTER_WAIT2S;
+        pumpSeqMs = now;
+        addEventLog("START: single requested (master ON, pump1 only)");
+        break;
+
+      case START_STAGGERED_AUTO_OFF:
+        digitalWrite(relayPins[3], LOW);
+        digitalWrite(relayPins[0], HIGH);
+        masterOn = true;
+        digitalWrite(relayPins[1], HIGH);
+        digitalWrite(relayPins[2], LOW);
+        pumpSeqState = PSEQ_ALT_WAIT5S;
+        pumpSeqMs = now;
+        addEventLog("START: staggered auto-off requested (pump1 ON now, pump2 in 5s, pump2 OFF after 40s)");
+        break;
+
+      case START_NONE:
+      default:
+        break;
+    }
   }
 
-  if (pendingMasterSolarStart && pumpSeqState == PSEQ_IDLE) {
-    useRelay4 = false;
-    startBothPumps = true;
-
-    digitalWrite(relayPins[3], LOW);  // ensure relay4 OFF
-    digitalWrite(relayPins[0], HIGH); // master ON
-    masterOn = true;
-
-    pumpSeqState = PSEQ_START_WAIT2S;
-    pumpSeqMs = now;
-
-    pendingMasterSolarStart = false;
-
-    addEventLog("START: master-solar/on requested (master ON, sequencing both pumps)");
-  }
-
-  if (pendingSingleStart && pumpSeqState == PSEQ_IDLE) {
-    useRelay4 = false;
-    startBothPumps = false;
-
-    digitalWrite(relayPins[3], LOW);  // ensure relay4 OFF
-    digitalWrite(relayPins[0], HIGH); // master ON
-    masterOn = true;
-
-    pumpSeqState = PSEQ_START_WAIT2S;
-    pumpSeqMs = now;
-
-    pendingSingleStart = false;
-
-    addEventLog("START: single requested (master ON, pump1 only)");
-  }
-
-  // State progression
   switch (pumpSeqState) {
     case PSEQ_IDLE:
       break;
 
     case PSEQ_RELAY4_WAIT5S:
       if (now - pumpSeqMs >= 5000) {
-        digitalWrite(relayPins[0], HIGH); // master ON after 5s pause
+        digitalWrite(relayPins[0], HIGH);
         masterOn = true;
-
-        pumpSeqState = PSEQ_START_WAIT2S;
+        pumpSeqState = PSEQ_MASTER_WAIT2S;
         pumpSeqMs = now;
-
         addEventLog("SEQ: master ON (after relay4 wait 5s)");
       }
       break;
 
-    case PSEQ_START_WAIT2S:
+    case PSEQ_MASTER_WAIT2S:
       if (now - pumpSeqMs >= 2000) {
-        digitalWrite(relayPins[1], HIGH); // pump1
+        digitalWrite(relayPins[1], HIGH);
         addEventLog("SEQ: pump1 ON");
 
-        if (startBothPumps) {
-          pumpSeqState = PSEQ_START_PUMP1_ON_WAIT4S;
-          pumpSeqMs = now;
-        } else {
-          digitalWrite(relayPins[2], LOW); // ensure pump2 stays off
-          pumpSeqState = PSEQ_IDLE;
-          addEventLog("SEQ: single mode complete (pump2 OFF, idle)");
+        if (digitalRead(relayPins[2]) == HIGH || digitalRead(relayPins[3]) == HIGH || masterOn) {
+          if (digitalRead(relayPins[2]) == LOW && digitalRead(relayPins[1]) == HIGH && pendingStartMode == START_NONE) {
+            // Continue based on actual requested mode context inferred from current outputs.
+          }
+        }
+
+        if (digitalRead(relayPins[2]) == LOW) {
+          if (digitalRead(relayPins[3]) == HIGH || masterOn) {
+            pumpSeqState = PSEQ_PUMP1_WAIT4S;
+            pumpSeqMs = now;
+          } else {
+            pumpSeqState = PSEQ_IDLE;
+          }
         }
       }
       break;
 
-    case PSEQ_START_PUMP1_ON_WAIT4S:
+    case PSEQ_PUMP1_WAIT4S:
       if (now - pumpSeqMs >= 4000) {
-        digitalWrite(relayPins[2], HIGH); // pump2
+        digitalWrite(relayPins[2], HIGH);
         pumpSeqState = PSEQ_IDLE;
         addEventLog("SEQ: pump2 ON (sequence complete, idle)");
       }
       break;
 
-    case PSEQ_STOP_WAIT500MS:
-      pumpSeqState = PSEQ_IDLE;
+    case PSEQ_ALT_WAIT5S:
+      if (now - pumpSeqMs >= 5000) {
+        digitalWrite(relayPins[2], HIGH);
+        pumpSeqState = PSEQ_ALT_PUMP2_HOLD40S;
+        pumpSeqMs = now;
+        addEventLog("SEQ: pump2 ON (5s after pump1)");
+      }
+      break;
+
+    case PSEQ_ALT_PUMP2_HOLD40S:
+      if (now - pumpSeqMs >= 40000) {
+        digitalWrite(relayPins[2], LOW);
+        pumpSeqState = PSEQ_IDLE;
+        addEventLog("SEQ: pump2 OFF after 40s hold (pump1 remains ON)");
+      }
       break;
   }
 }
@@ -388,13 +544,12 @@ void runPumpSequencer() {
 void handleRoot() {
   bool authorized = isWebAuthorized();
 
-  // WiFi info
   String wifiState = (WiFi.status() == WL_CONNECTED) ? "CONNECTED" : "DISCONNECTED";
   String wifiIP = WiFi.localIP().toString();
   String wifiGW = WiFi.gatewayIP().toString();
   String wifiMask = WiFi.subnetMask().toString();
   String wifiSSID = WiFi.SSID();
-  int wifiRSSI = WiFi.RSSI(); // dBm (typically -30 .. -90)
+  int wifiRSSI = WiFi.RSSI();
   String wifiMAC = WiFi.macAddress();
 
   String roothtml;
@@ -410,17 +565,19 @@ void handleRoot() {
   roothtml += "<div>FW: ";
   roothtml += FW_VERSION;
   roothtml += "</div>";
+  roothtml += "<div>Now: " + htmlEscape(nowString()) + "</div>";
+  roothtml += "<div>Uptime: " + htmlEscape(formatUptime(millis())) + "</div>";
 
   roothtml += "<hr style='max-width:900px;'>";
 
   roothtml += "<b>WiFi</b><br>";
-  roothtml += "Status: " + wifiState + "<br>";
-  roothtml += "SSID: " + wifiSSID + "<br>";
+  roothtml += "Status: " + htmlEscape(wifiState) + "<br>";
+  roothtml += "SSID: " + htmlEscape(wifiSSID) + "<br>";
   roothtml += "RSSI: " + String(wifiRSSI) + " dBm<br>";
-  roothtml += "IP: " + wifiIP + "<br>";
-  roothtml += "Gateway: " + wifiGW + "<br>";
-  roothtml += "Subnet: " + wifiMask + "<br>";
-  roothtml += "MAC: " + wifiMAC + "<br>";
+  roothtml += "IP: " + htmlEscape(wifiIP) + "<br>";
+  roothtml += "Gateway: " + htmlEscape(wifiGW) + "<br>";
+  roothtml += "Subnet: " + htmlEscape(wifiMask) + "<br>";
+  roothtml += "MAC: " + htmlEscape(wifiMAC) + "<br>";
 
   roothtml += "<hr style='max-width:900px;'>";
 
@@ -431,7 +588,7 @@ void handleRoot() {
   roothtml += "<br><br>Pressione: raw ";
   roothtml += raw;
   roothtml += " | bar ";
-  roothtml += valore;
+  roothtml += String(valore, 2);
 
   roothtml += "<br><br><a href=/logs>View logs</a>";
   roothtml += "<br><a href=/pressure>View pressure (last hour)</a>";
@@ -445,7 +602,9 @@ void handleRoot() {
     roothtml += "<br><br><a href=/master/on" + pwq + ">Accendi entrambe</a>";
     roothtml += "<br><br><a href=/master-solar/on" + pwq + ">Accendi master solar</a>";
     roothtml += "<br><br><a href=/single" + pwq + ">Accendi singola</a>";
+    roothtml += "<br><br><a href=/staggered-auto" + pwq + ">Accendi doppia sequenza 5s / spegni seconda dopo 40s</a>";
     roothtml += "<br><br><a href=/master/off" + pwq + ">SPEGNI</a>";
+    roothtml += "<br><br><button onclick=\"if(confirm('Reboot controller now?')){window.location='/reboot" + pwq + "';}\">Reboot controller</button>";
   } else {
 #if ENABLE_WEB_PASSWORD
     roothtml += "<br><br><font color=gray>Controls hidden. Use /?pw=**** to enable.</font>";
@@ -459,7 +618,6 @@ void handleRoot() {
   server.send(200, "text/html", roothtml);
 }
 
-// ---- /logs ----
 void handleLogs() {
   String html;
   html += "<!DOCTYPE HTML><html><head>";
@@ -485,7 +643,7 @@ void handleLogs() {
       html += "<tr><td>";
       html += String(i + 1);
       html += "</td><td><pre style='margin:0;white-space:pre-wrap;'>";
-      html += eventLogs[idx];
+      html += htmlEscape(eventLogs[idx]);
       html += "</pre></td></tr>";
     }
   }
@@ -496,7 +654,6 @@ void handleLogs() {
   server.send(200, "text/html", html);
 }
 
-// ---- /pressure ----
 void handlePressure() {
   String html;
   html += "<!DOCTYPE HTML><html><head>";
@@ -512,7 +669,7 @@ void handlePressure() {
 
   uint16_t curCb = rawToCentibar(raw);
   float curBar = curCb / 100.0f;
-  html += "<div>Now: " + nowString() + " | current: " + String(curBar, 2) + " bar</div><br>";
+  html += "<div>Now: " + htmlEscape(nowString()) + " | current: " + String(curBar, 2) + " bar</div><br>";
 
   html += "<canvas id='c' width='1000' height='300'></canvas>";
 
@@ -554,7 +711,6 @@ function draw(){
   const padL=60, padR=10, padT=10, padB=25;
   const plotW=W-padL-padR, plotH=H-padT-padB;
 
-  // axes
   ctx.strokeStyle='#999';
   ctx.beginPath();
   ctx.moveTo(padL, padT);
@@ -562,17 +718,14 @@ function draw(){
   ctx.lineTo(padL+plotW, padT+plotH);
   ctx.stroke();
 
-  // y labels
   ctx.fillStyle='#333';
   ctx.font='12px Arial';
   ctx.fillText(max.toFixed(2)+' bar', 5, padT+10);
   ctx.fillText(min.toFixed(2)+' bar', 5, padT+plotH);
 
-  // x labels
   ctx.fillText('60 min ago', padL, H-5);
   ctx.fillText('now', padL+plotW-25, H-5);
 
-  // polyline
   ctx.strokeStyle='#0a6';
   ctx.lineWidth=1;
   ctx.beginPath();
@@ -592,6 +745,14 @@ draw();
   server.send(200, "text/html", html);
 }
 
+void handleReboot() {
+  if (!ensureAuthorized()) return;
+  addEventLog("RESTART: reboot requested from web UI");
+  server.send(200, "text/html", "<font color=orange size=5>rebooting...</font>");
+  delay(250);
+  ESP.restart();
+}
+
 void setup() {
   pinMode(ledPin, OUTPUT);
   digitalWrite(ledPin, LOW);
@@ -608,15 +769,13 @@ void setup() {
   bootMs = millis();
   lastPingMs = 0;
   pingFailCount = 0;
+  lastPingTriggeredRestartMs = 0;
 
   pressureTimer = millis() + 1000;
   pinMode(analogPin, INPUT);
 
   for (int i = 0; i < numRelays; i++) {
     pinMode(relayPins[i], OUTPUT);
-  }
-
-  for (int i = 0; i < numRelays; i++) {
     digitalWrite(relayPins[i], LOW);
   }
 
@@ -624,72 +783,47 @@ void setup() {
   pressureHistHead = 0;
   pressureHistCount = 0;
 
-  WiFi.config(staticIP, gateway, subnet);
-  WiFi.begin(ssid, password);
+  setupWiFi();
+  configureLocalTime();
 
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-    if (counterFlag == false) {
-      startMillis = millis();
-      counterFlag = true;
-    } else {
-      currentMillis = millis();
-      if (currentMillis - startMillis >= period) {
-        addEventLog("RESTART: wifi connect timeout");
-        Serial.println("RESTART: wifi connect timeout");
-        ESP.restart();
-      }
-    }
-  }
-
-  digitalWrite(ledPin, HIGH);
-  Serial.println("Connected to WiFi");
-  Serial.print("IP address: ");
-  Serial.println(WiFi.localIP());
-
-  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
-
-  addEventLog("BOOT: firmware " + String(FW_VERSION) + " started, IP " + WiFi.localIP().toString());
+  addEventLog("BOOT: firmware " + String(FW_VERSION) + " started");
 
   server.on("/", handleRoot);
   server.on("/logs", handleLogs);
   server.on("/pressure", handlePressure);
 
   server.on("/master/on", HTTP_GET, []() {
-    clearPressureAlertLogs();
-    pendingMasterStart = true;
-    pendingMasterSolarStart = false;
-    pendingSingleStart = false;
-    pendingStop = false;
+    if (!ensureAuthorized()) return;
+    queueStartMode(START_MASTER_BOTH, "master/on");
     server.send(200, "text/html", "<font color=red size=5>master starting...</font>");
   });
 
   server.on("/master-solar/on", HTTP_GET, []() {
-    clearPressureAlertLogs();
-    pendingMasterSolarStart = true;
-    pendingMasterStart = false;
-    pendingSingleStart = false;
-    pendingStop = false;
+    if (!ensureAuthorized()) return;
+    queueStartMode(START_MASTER_SOLAR_BOTH, "master-solar/on");
     server.send(200, "text/html", "<font color=red size=5>master solar starting...</font>");
   });
 
   server.on("/single", HTTP_GET, []() {
-    clearPressureAlertLogs();
-    pendingSingleStart = true;
-    pendingMasterStart = false;
-    pendingMasterSolarStart = false;
-    pendingStop = false;
+    if (!ensureAuthorized()) return;
+    queueStartMode(START_SINGLE_ONLY, "single");
     server.send(200, "text/html", "<font color=red size=5>single starting...</font>");
   });
 
+  server.on("/staggered-auto", HTTP_GET, []() {
+    if (!ensureAuthorized()) return;
+    queueStartMode(START_STAGGERED_AUTO_OFF, "staggered-auto");
+    server.send(200, "text/html", "<font color=red size=5>staggered auto sequence starting...</font>");
+  });
+
   server.on("/master/off", HTTP_GET, []() {
+    if (!ensureAuthorized()) return;
     pendingStop = true;
-    pendingMasterStart = false;
-    pendingMasterSolarStart = false;
-    pendingSingleStart = false;
+    pendingStartMode = START_NONE;
     server.send(200, "text/html", "<font color=green size=5>stopping...</font>");
   });
+
+  server.on("/reboot", HTTP_GET, handleReboot);
 
   server.begin();
   Serial.println("HTTP server started");
@@ -698,6 +832,8 @@ void setup() {
 void loop() {
   server.handleClient();
 
+  ensureWiFiConnected();
+  ensureTimeConfigured();
   runPumpSequencer();
   monitorPingAndRebootWhenPumpsOff();
 
