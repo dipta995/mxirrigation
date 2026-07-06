@@ -4,6 +4,15 @@
 
   Board: T7 V1.3 MINI 32 ESP32
   Firmware: 1011
+
+  Centralina per comando elettrovalvole latch tramite ponti ad H 
+
+  arduino IDE settings:
+  lolin s2 mini
+  cdc on boot enabled
+  firmare msc disabled
+  default 4mb with spiffs
+  
 */
 
 #include <WiFi.h>
@@ -66,6 +75,10 @@ const int VALVE_COUNT = 8;
 // Definitive GPIOs
 const int valveA[VALVE_COUNT] = {22, 17, 27, 32, 0, 19, 5, 26};
 const int valveB[VALVE_COUNT] = {21, 16, 25, 4, 2, 23, 33, 18};
+
+// GPIO vers. 1 ( crono ) 
+//const int valveA[VALVE_COUNT] = {0, 18, 21, 23, 26, 16, 22, 32};
+//const int valveB[VALVE_COUNT] = {2, 19, 22, 25, 27, 17, 33, 4};
 
 bool valveStatus[VALVE_COUNT] = {false, false, false, false, false, false, false, false};
 
