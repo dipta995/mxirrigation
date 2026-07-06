@@ -1,7 +1,7 @@
 /*
   MxIrrigation by MxSolutions.it
   Author: Nicola Deboni, Mx Solutions
-  Firmware version: 1.2.0
+  Firmware version: 1.2.1
 
   Description
   -----------
@@ -25,9 +25,11 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <ESPping.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
 #include <time.h>
 
-const char* FW_VERSION = "1.2.0";
+const char* FW_VERSION = "1.2.1";
 
 const char *ssid = "WMPSERVICE";
 const char *password = "motocross";
@@ -60,6 +62,10 @@ const char* WEB_PW_PARAM = "pw";     // URL: /?pw=1234
 const char* TZ_INFO = "CET-1CEST,M3.5.0/2,M10.5.0/3"; // Italy local time with DST
 const unsigned long NTP_RETRY_PERIOD_MS = 60000;
 unsigned long lastNtpSyncAttemptMs = 0;
+
+// ---- ntfy alerts ----
+const char* NTFY_SERVER = "https://ntfy.sh";
+const char* NTFY_TOPIC  = "wmp-irrigation";
 
 // ---- High/Low pressure shutdown settings/state ----
 const int RAW_LIMIT = 2000;
@@ -112,8 +118,8 @@ enum PumpSequenceState {
   PSEQ_RELAY4_WAIT5S,
   PSEQ_MASTER_WAIT2S,
   PSEQ_PUMP1_WAIT4S,
-  PSEQ_ALT_WAIT5S,
-  PSEQ_ALT_PUMP2_HOLD40S
+  PSEQ_STAGGERED_PUMP2_WAIT,
+  PSEQ_STAGGERED_PUMP2_HOLD
 };
 
 enum StartMode {
@@ -127,6 +133,7 @@ enum StartMode {
 PumpSequenceState pumpSeqState = PSEQ_IDLE;
 unsigned long pumpSeqMs = 0;
 StartMode pendingStartMode = START_NONE;
+StartMode activeStartMode = START_NONE;
 bool pendingStop = false;
 
 // Forward declarations
@@ -134,18 +141,21 @@ static int median3(int a, int b, int c);
 String nowString();
 String formatUptime(unsigned long uptimeMs);
 String htmlEscape(const String& s);
+String urlEncode(const String& s);
 void addEventLog(const String& msg);
 void addPressureSampleCentibar(uint16_t centibar);
 uint16_t rawToCentibar(int rawValue);
 void clearPressureAlertLogs();
 bool isWebAuthorized();
 bool ensureAuthorized();
+void resetSequencer();
 void stopAllPumps(const String& reason);
 void queueStartMode(StartMode mode, const String& actionLabel);
 void setupWiFi();
 void ensureWiFiConnected();
 void configureLocalTime();
 void ensureTimeConfigured();
+void sendNtfyNotification(const String& title, const String& message, const String& priority, const String& tags);
 void checkHighPressureTrip();
 void checkLowPressureTripWhilePumpsOn();
 void monitorPingAndRebootWhenPumpsOff();
@@ -209,6 +219,29 @@ String htmlEscape(const String& s) {
   return out;
 }
 
+String urlEncode(const String& s) {
+  String out;
+  char hex[4];
+  out.reserve(s.length() * 3);
+
+  for (size_t i = 0; i < s.length(); i++) {
+    unsigned char c = (unsigned char)s[i];
+    if ((c >= 'a' && c <= 'z') ||
+        (c >= 'A' && c <= 'Z') ||
+        (c >= '0' && c <= '9') ||
+        c == '-' || c == '_' || c == '.' || c == '~') {
+      out += (char)c;
+    } else if (c == ' ') {
+      out += "%20";
+    } else {
+      snprintf(hex, sizeof(hex), "%%%02X", c);
+      out += hex;
+    }
+  }
+
+  return out;
+}
+
 void addEventLog(const String& msg) {
   eventLogs[eventLogHead] = nowString() + " - " + msg;
   eventLogHead = (eventLogHead + 1) % EVENT_LOG_CAPACITY;
@@ -249,12 +282,18 @@ bool ensureAuthorized() {
   return false;
 }
 
+void resetSequencer() {
+  pumpSeqState = PSEQ_IDLE;
+  pumpSeqMs = 0;
+  pendingStartMode = START_NONE;
+  activeStartMode = START_NONE;
+  pendingStop = false;
+}
+
 void stopAllPumps(const String& reason) {
   for (int i = 0; i < numRelays; i++) digitalWrite(relayPins[i], LOW);
   masterOn = false;
-  pumpSeqState = PSEQ_IDLE;
-  pendingStartMode = START_NONE;
-  pendingStop = false;
+  resetSequencer();
   addEventLog(reason);
 }
 
@@ -327,6 +366,41 @@ void ensureWiFiConnected() {
   }
 }
 
+void sendNtfyNotification(const String& title, const String& message, const String& priority, const String& tags) {
+  if (WiFi.status() != WL_CONNECTED) {
+    addEventLog("NTFY: skipped notification, WiFi disconnected");
+    return;
+  }
+
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient http;
+  String url = String(NTFY_SERVER) + "/" + String(NTFY_TOPIC) + "/publish?";
+  url += "title=" + urlEncode(title);
+  url += "&message=" + urlEncode(message);
+  url += "&priority=" + urlEncode(priority);
+  if (tags.length() > 0) {
+    url += "&tags=" + urlEncode(tags);
+  }
+
+  if (!http.begin(client, url)) {
+    addEventLog("NTFY: begin failed");
+    return;
+  }
+
+  int httpCode = http.GET();
+  if (httpCode > 0) {
+    addEventLog("NTFY: sent (" + String(httpCode) + ") " + title);
+    Serial.println("NTFY sent: " + title);
+  } else {
+    addEventLog("NTFY: failed to send " + title + " err=" + String(httpCode));
+    Serial.println("NTFY send failed");
+  }
+
+  http.end();
+}
+
 void checkHighPressureTrip() {
   if (raw > RAW_LIMIT) {
     if (rawOverStartMs == 0) {
@@ -343,6 +417,15 @@ void checkHighPressureTrip() {
       pressureTripLog += "Time: " + nowString() + "<br>";
       pressureTripLog += "Raw: " + String(raw) + " (limit " + String(RAW_LIMIT) + ")<br>";
       pressureTripLog += "</div>";
+
+      sendNtfyNotification(
+        "MxIrrigation high pressure alert",
+        "Pumps stopped due to high pressure at " + nowString() +
+        ". Raw=" + String(raw) +
+        ", limit=" + String(RAW_LIMIT),
+        "high",
+        "warning,pressure"
+      );
 
       Serial.println("ALERT: High pressure trip. Pumps shut off. raw=" + String(raw));
     }
@@ -372,6 +455,15 @@ void checkLowPressureTripWhilePumpsOn() {
       lowPressureTripLog += "Time: " + nowString() + "<br>";
       lowPressureTripLog += "Raw: " + String(raw) + " (min " + String(RAW_MIN_LIMIT) + ")<br>";
       lowPressureTripLog += "</div>";
+
+      sendNtfyNotification(
+        "MxIrrigation low pressure alert",
+        "Pumps stopped due to low pressure at " + nowString() +
+        ". Raw=" + String(raw) +
+        ", min=" + String(RAW_MIN_LIMIT),
+        "high",
+        "warning,pressure"
+      );
 
       Serial.println("ALERT: Low pressure trip. Pumps shut off. raw=" + String(raw));
     }
@@ -432,12 +524,16 @@ void runPumpSequencer() {
   }
 
   if (pumpSeqState == PSEQ_IDLE && pendingStartMode != START_NONE) {
-    StartMode mode = pendingStartMode;
+    activeStartMode = pendingStartMode;
     pendingStartMode = START_NONE;
 
-    switch (mode) {
+    switch (activeStartMode) {
       case START_MASTER_BOTH:
-        digitalWrite(relayPins[3], HIGH);
+        digitalWrite(relayPins[3], HIGH); // relay4 ON first
+        digitalWrite(relayPins[0], LOW);
+        digitalWrite(relayPins[1], LOW);
+        digitalWrite(relayPins[2], LOW);
+        masterOn = false;
         pumpSeqState = PSEQ_RELAY4_WAIT5S;
         pumpSeqMs = now;
         addEventLog("START: master/on requested (relay4 ON, sequencing both pumps)");
@@ -445,7 +541,9 @@ void runPumpSequencer() {
 
       case START_MASTER_SOLAR_BOTH:
         digitalWrite(relayPins[3], LOW);
-        digitalWrite(relayPins[0], HIGH);
+        digitalWrite(relayPins[0], HIGH); // master ON
+        digitalWrite(relayPins[1], LOW);
+        digitalWrite(relayPins[2], LOW);
         masterOn = true;
         pumpSeqState = PSEQ_MASTER_WAIT2S;
         pumpSeqMs = now;
@@ -454,7 +552,9 @@ void runPumpSequencer() {
 
       case START_SINGLE_ONLY:
         digitalWrite(relayPins[3], LOW);
-        digitalWrite(relayPins[0], HIGH);
+        digitalWrite(relayPins[0], HIGH); // master ON
+        digitalWrite(relayPins[1], LOW);
+        digitalWrite(relayPins[2], LOW);
         masterOn = true;
         pumpSeqState = PSEQ_MASTER_WAIT2S;
         pumpSeqMs = now;
@@ -463,17 +563,18 @@ void runPumpSequencer() {
 
       case START_STAGGERED_AUTO_OFF:
         digitalWrite(relayPins[3], LOW);
-        digitalWrite(relayPins[0], HIGH);
+        digitalWrite(relayPins[0], HIGH); // master ON
+        digitalWrite(relayPins[1], HIGH); // pump1 ON immediately
+        digitalWrite(relayPins[2], LOW);  // pump2 OFF initially
         masterOn = true;
-        digitalWrite(relayPins[1], HIGH);
-        digitalWrite(relayPins[2], LOW);
-        pumpSeqState = PSEQ_ALT_WAIT5S;
+        pumpSeqState = PSEQ_STAGGERED_PUMP2_WAIT;
         pumpSeqMs = now;
         addEventLog("START: staggered auto-off requested (pump1 ON now, pump2 in 5s, pump2 OFF after 40s)");
         break;
 
       case START_NONE:
       default:
+        activeStartMode = START_NONE;
         break;
     }
   }
@@ -484,7 +585,7 @@ void runPumpSequencer() {
 
     case PSEQ_RELAY4_WAIT5S:
       if (now - pumpSeqMs >= 5000) {
-        digitalWrite(relayPins[0], HIGH);
+        digitalWrite(relayPins[0], HIGH); // master ON
         masterOn = true;
         pumpSeqState = PSEQ_MASTER_WAIT2S;
         pumpSeqMs = now;
@@ -494,47 +595,44 @@ void runPumpSequencer() {
 
     case PSEQ_MASTER_WAIT2S:
       if (now - pumpSeqMs >= 2000) {
-        digitalWrite(relayPins[1], HIGH);
+        digitalWrite(relayPins[1], HIGH); // pump1 ON
         addEventLog("SEQ: pump1 ON");
 
-        if (digitalRead(relayPins[2]) == HIGH || digitalRead(relayPins[3]) == HIGH || masterOn) {
-          if (digitalRead(relayPins[2]) == LOW && digitalRead(relayPins[1]) == HIGH && pendingStartMode == START_NONE) {
-            // Continue based on actual requested mode context inferred from current outputs.
-          }
-        }
-
-        if (digitalRead(relayPins[2]) == LOW) {
-          if (digitalRead(relayPins[3]) == HIGH || masterOn) {
-            pumpSeqState = PSEQ_PUMP1_WAIT4S;
-            pumpSeqMs = now;
-          } else {
-            pumpSeqState = PSEQ_IDLE;
-          }
+        if (activeStartMode == START_SINGLE_ONLY) {
+          digitalWrite(relayPins[2], LOW);
+          pumpSeqState = PSEQ_IDLE;
+          activeStartMode = START_NONE;
+          addEventLog("SEQ: single mode complete (pump2 OFF, idle)");
+        } else {
+          pumpSeqState = PSEQ_PUMP1_WAIT4S;
+          pumpSeqMs = now;
         }
       }
       break;
 
     case PSEQ_PUMP1_WAIT4S:
       if (now - pumpSeqMs >= 4000) {
-        digitalWrite(relayPins[2], HIGH);
+        digitalWrite(relayPins[2], HIGH); // pump2 ON
         pumpSeqState = PSEQ_IDLE;
+        activeStartMode = START_NONE;
         addEventLog("SEQ: pump2 ON (sequence complete, idle)");
       }
       break;
 
-    case PSEQ_ALT_WAIT5S:
+    case PSEQ_STAGGERED_PUMP2_WAIT:
       if (now - pumpSeqMs >= 5000) {
-        digitalWrite(relayPins[2], HIGH);
-        pumpSeqState = PSEQ_ALT_PUMP2_HOLD40S;
+        digitalWrite(relayPins[2], HIGH); // pump2 ON
+        pumpSeqState = PSEQ_STAGGERED_PUMP2_HOLD;
         pumpSeqMs = now;
         addEventLog("SEQ: pump2 ON (5s after pump1)");
       }
       break;
 
-    case PSEQ_ALT_PUMP2_HOLD40S:
+    case PSEQ_STAGGERED_PUMP2_HOLD:
       if (now - pumpSeqMs >= 40000) {
-        digitalWrite(relayPins[2], LOW);
+        digitalWrite(relayPins[2], LOW); // pump2 OFF
         pumpSeqState = PSEQ_IDLE;
+        activeStartMode = START_NONE;
         addEventLog("SEQ: pump2 OFF after 40s hold (pump1 remains ON)");
       }
       break;
