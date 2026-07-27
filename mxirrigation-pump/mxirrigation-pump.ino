@@ -54,7 +54,7 @@ unsigned long pressureTimer;
 bool masterOn = false;
 
 // ---- Web UI password (query string) ----
-#define ENABLE_WEB_PASSWORD 1
+#define ENABLE_WEB_PASSWORD 0
 const char* WEB_PASSWORD = "1234";   // <-- change this
 const char* WEB_PW_PARAM = "pw";     // URL: /?pw=1234
 
@@ -68,11 +68,11 @@ const char* NTFY_SERVER = "https://ntfy.sh";
 const char* NTFY_TOPIC  = "wmp-irrigation";
 
 // ---- High/Low pressure shutdown settings/state ----
-const int RAW_LIMIT = 2000;
+const int RAW_LIMIT = 1200;
 const unsigned long RAW_OVER_LIMIT_MS = 15000;
 
-const int RAW_MIN_LIMIT = 500;
-const unsigned long RAW_UNDER_LIMIT_MS = 60000;
+const int RAW_MIN_LIMIT = 150;
+const unsigned long RAW_UNDER_LIMIT_MS = 260000;
 
 unsigned long rawOverStartMs = 0;
 unsigned long rawUnderStartMs = 0;
@@ -659,7 +659,7 @@ void handleRoot() {
   roothtml += "<title>MxIrrigation - Pump control</title></head><body>";
   roothtml += "<div align=center>";
 
-  roothtml += "<h2>MxIrrigation</h2>";
+  roothtml += "<h2>MxIrrigation Pump Controller</h2>";
   roothtml += "<div>FW: ";
   roothtml += FW_VERSION;
   roothtml += "</div>";

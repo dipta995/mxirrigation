@@ -51,11 +51,11 @@ const unsigned long TIME_SYNC_RETRY_MS = 30000;
 #define SERIAL_VALVE_DEBUG 1
 
 // Wi-Fi
-const char* ssid = "WMPHOUSE";
+const char* ssid = "WMPSERVICE";
 const char* password = "motocross";
 
 // Network
-IPAddress staticIP(192, 168, 5, 44);
+IPAddress staticIP(192, 168, 5, 40);
 IPAddress gateway(192, 168, 5, 1);
 IPAddress subnet(255, 255, 255, 0);
 IPAddress dns1(8, 8, 8, 8);
@@ -67,7 +67,7 @@ const char* ntpServer2 = "time.nist.gov";
 const char* time_zone = "CET-1CEST,M3.5.0,M10.5.0/3";
 
 // Remote host to ping for link health
-const char* monitorHost = "192.168.5.40";
+const char* monitorHost = "192.168.5.1";
 
 const int COMMAND_LOG_SIZE = 4;
 const int VALVE_COUNT = 8;
@@ -77,8 +77,8 @@ const int valveA[VALVE_COUNT] = {22, 17, 27, 32, 0, 19, 5, 26};
 const int valveB[VALVE_COUNT] = {21, 16, 25, 4, 2, 23, 33, 18};
 
 // GPIO vers. 1 ( crono ) 
-//const int valveA[VALVE_COUNT] = {0, 18, 21, 23, 26, 16, 22, 32};
-//const int valveB[VALVE_COUNT] = {2, 19, 22, 25, 27, 17, 33, 4};
+//const int valveA[VALVE_COUNT] = {0, 18, 21, 23, 26, 16, 32, 4};
+//const int valveB[VALVE_COUNT] = {2, 19, 22, 25, 27, 17, 33, 5};
 
 bool valveStatus[VALVE_COUNT] = {false, false, false, false, false, false, false, false};
 
@@ -415,7 +415,7 @@ void sendHomePage() {
   formatTimeNow(timeBuf, sizeof(timeBuf));
 
   startHtml("MxIrrigation");
-  sendFmt("<h3>MxIrrigation %s</h3>", FW_VERSION);
+  sendFmt("<h3>MxIrrigation Valvole Sala Pompe </h3>");
   sendNavCompact();
   sendFmt("<p>%s %s</p>", dateBuf, timeBuf);
   sendChunk("<ul>");
