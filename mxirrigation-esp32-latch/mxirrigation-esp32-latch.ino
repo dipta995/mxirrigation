@@ -51,11 +51,12 @@ const unsigned long TIME_SYNC_RETRY_MS = 30000;
 #define SERIAL_VALVE_DEBUG 1
 
 // Wi-Fi
-const char* ssid = "WMPSERVICE";
+const char* ssid = "WAFNAMOTOPARK";
+//const char* ssid = "WMPHOUSE";
 const char* password = "motocross";
 
 // Network
-IPAddress staticIP(192, 168, 5, 40);
+IPAddress staticIP(192, 168, 5, 42);
 IPAddress gateway(192, 168, 5, 1);
 IPAddress subnet(255, 255, 255, 0);
 IPAddress dns1(8, 8, 8, 8);
@@ -73,12 +74,16 @@ const int COMMAND_LOG_SIZE = 4;
 const int VALVE_COUNT = 8;
 
 // Definitive GPIOs
-const int valveA[VALVE_COUNT] = {22, 17, 27, 32, 0, 19, 5, 26};
-const int valveB[VALVE_COUNT] = {21, 16, 25, 4, 2, 23, 33, 18};
+//const int valveA[VALVE_COUNT] = {22, 17, 27, 32, 0, 19, 5, 26};
+//const int valveB[VALVE_COUNT] = {21, 16, 25, 4, 2, 23, 33, 18};
 
 // GPIO vers. 1 ( crono ) 
 //const int valveA[VALVE_COUNT] = {0, 18, 21, 23, 26, 16, 32, 4};
 //const int valveB[VALVE_COUNT] = {2, 19, 22, 25, 27, 17, 33, 5};
+
+// GPIO per ESP-32U
+const int valveA[VALVE_COUNT] = {13, 16, 18, 21, 23, 26, 32, 4};
+const int valveB[VALVE_COUNT] = {14, 17, 19, 22, 25, 27, 33, 5};
 
 bool valveStatus[VALVE_COUNT] = {false, false, false, false, false, false, false, false};
 
@@ -415,7 +420,7 @@ void sendHomePage() {
   formatTimeNow(timeBuf, sizeof(timeBuf));
 
   startHtml("MxIrrigation");
-  sendFmt("<h3>MxIrrigation Valvole Sala Pompe </h3>");
+  sendFmt("<h3>MxIrrigation Valvole Crono </h3>");
   sendNavCompact();
   sendFmt("<p>%s %s</p>", dateBuf, timeBuf);
   sendChunk("<ul>");

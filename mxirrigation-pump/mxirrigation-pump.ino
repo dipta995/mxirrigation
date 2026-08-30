@@ -1,7 +1,7 @@
 /*
   MxIrrigation by MxSolutions.it
   Author: Nicola Deboni, Mx Solutions
-  Firmware version: 1.2.1
+  Firmware version: 1.2.2
 
   Description
   -----------
@@ -29,7 +29,7 @@
 #include <WiFiClientSecure.h>
 #include <time.h>
 
-const char* FW_VERSION = "1.2.1";
+const char* FW_VERSION = "1.2.2";
 
 const char *ssid = "WMPSERVICE";
 const char *password = "motocross";
@@ -37,6 +37,9 @@ const char *password = "motocross";
 IPAddress staticIP(192, 168, 5, 43);
 IPAddress gateway(192, 168, 5, 1);
 IPAddress subnet(255, 255, 255, 0);
+// Static IP requires explicit DNS servers when hostnames are used (NTP, ntfy, etc.).
+IPAddress dns1(192, 168, 5, 1);  // router/local DNS
+IPAddress dns2(1, 1, 1, 1);      // fallback DNS
 
 WebServer server(80);
 
@@ -60,8 +63,14 @@ const char* WEB_PW_PARAM = "pw";     // URL: /?pw=1234
 
 // ---- Timezone / NTP ----
 const char* TZ_INFO = "CET-1CEST,M3.5.0/2,M10.5.0/3"; // Italy local time with DST
+const char* NTP_SERVER_1 = "it.pool.ntp.org";
+const char* NTP_SERVER_2 = "pool.ntp.org";
+const char* NTP_SERVER_3 = "time.google.com";
 const unsigned long NTP_RETRY_PERIOD_MS = 60000;
+const time_t MIN_VALID_EPOCH = 1704067200; // 2024-01-01 UTC
 unsigned long lastNtpSyncAttemptMs = 0;
+bool ntpConfigured = false;
+bool ntpSyncLogged = false;
 
 // ---- ntfy alerts ----
 const char* NTFY_SERVER = "https://ntfy.sh";
@@ -69,7 +78,7 @@ const char* NTFY_TOPIC  = "wmp-irrigation";
 
 // ---- High/Low pressure shutdown settings/state ----
 const int RAW_LIMIT = 1200;
-const unsigned long RAW_OVER_LIMIT_MS = 15000;
+const unsigned long RAW_OVER_LIMIT_MS = 20000;
 
 const int RAW_MIN_LIMIT = 150;
 const unsigned long RAW_UNDER_LIMIT_MS = 260000;
@@ -138,6 +147,7 @@ bool pendingStop = false;
 
 // Forward declarations
 static int median3(int a, int b, int c);
+bool isTimeValid();
 String nowString();
 String formatUptime(unsigned long uptimeMs);
 String htmlEscape(const String& s);
@@ -192,11 +202,20 @@ String formatUptime(unsigned long uptimeMs) {
   return out;
 }
 
+bool isTimeValid() {
+  time_t now = time(nullptr);
+  return now >= MIN_VALID_EPOCH;
+}
+
 String nowString() {
-  struct tm timeinfo;
-  if (!getLocalTime(&timeinfo)) {
+  time_t now = time(nullptr);
+  if (now < MIN_VALID_EPOCH) {
     return "NTP not set (uptime " + formatUptime(millis()) + ")";
   }
+
+  struct tm timeinfo;
+  localtime_r(&now, &timeinfo);
+
   char buf[32];
   strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &timeinfo);
   return String(buf);
@@ -305,19 +324,49 @@ void queueStartMode(StartMode mode, const String& actionLabel) {
 }
 
 void configureLocalTime() {
-  setenv("TZ", TZ_INFO, 1);
-  tzset();
-  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+  if (WiFi.status() != WL_CONNECTED) return;
+
   lastNtpSyncAttemptMs = millis();
+
+  Serial.println("NTP: configuring time service");
+  Serial.print("DNS 1: ");
+  Serial.println(WiFi.dnsIP(0));
+  Serial.print("DNS 2: ");
+  Serial.println(WiFi.dnsIP(1));
+
+  // Test DNS explicitly so failures are visible on Serial.
+  IPAddress resolvedIP;
+  if (WiFi.hostByName(NTP_SERVER_1, resolvedIP)) {
+    Serial.print("NTP: ");
+    Serial.print(NTP_SERVER_1);
+    Serial.print(" resolved to ");
+    Serial.println(resolvedIP);
+  } else {
+    Serial.print("NTP: DNS resolution failed for ");
+    Serial.println(NTP_SERVER_1);
+  }
+
+  // configTzTime configures both SNTP and the Europe/Rome daylight-saving rules.
+  configTzTime(TZ_INFO, NTP_SERVER_1, NTP_SERVER_2, NTP_SERVER_3);
+  ntpConfigured = true;
 }
 
 void ensureTimeConfigured() {
-  struct tm timeinfo;
-  if (getLocalTime(&timeinfo, 100)) return;
+  if (isTimeValid()) {
+    if (!ntpSyncLogged) {
+      ntpSyncLogged = true;
+      Serial.println(String("NTP: synchronized, local time ") + nowString());
+      addEventLog("NTP: synchronized");
+    }
+    return;
+  }
 
-  unsigned long now = millis();
-  if (lastNtpSyncAttemptMs == 0 || now - lastNtpSyncAttemptMs >= NTP_RETRY_PERIOD_MS) {
-    Serial.println("NTP retry");
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  unsigned long nowMs = millis();
+  if (!ntpConfigured || lastNtpSyncAttemptMs == 0 ||
+      nowMs - lastNtpSyncAttemptMs >= NTP_RETRY_PERIOD_MS) {
+    Serial.println(ntpConfigured ? "NTP: retry" : "NTP: first attempt");
     configureLocalTime();
   }
 }
@@ -326,7 +375,9 @@ void setupWiFi() {
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);
   WiFi.persistent(false);
-  WiFi.config(staticIP, gateway, subnet);
+  if (!WiFi.config(staticIP, gateway, subnet, dns1, dns2)) {
+    Serial.println("WIFI: static IP/DNS configuration failed");
+  }
   WiFi.begin(ssid, password);
   wifiConnecting = true;
   wifiConnectAttemptStartMs = millis();
@@ -882,7 +933,7 @@ void setup() {
   pressureHistCount = 0;
 
   setupWiFi();
-  configureLocalTime();
+  // NTP is started by ensureTimeConfigured() only after WiFi is connected.
 
   addEventLog("BOOT: firmware " + String(FW_VERSION) + " started");
 
