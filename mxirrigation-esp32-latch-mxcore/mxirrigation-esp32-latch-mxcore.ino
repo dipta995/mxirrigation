@@ -1,0 +1,1126 @@
+/**
+ * ============================================================================
+ * Progetto:    MxIrrigation - Centralina valvole latch (H-bridge)
+ * File:        mxirrigation-esp32-latch-mxcore.ino
+ * Autore:      Nicola Deboni - MxSolutions
+ * Versione:    1018
+ * Ultima mod.: 2026-09-19
+ * Repository:  vault "03 - Elettronica/Progetti/mxirrigation" -> vedi
+ *              [[esp32-latch-hbridge]] e [[mxirrigation]]
+ * ----------------------------------------------------------------------------
+ * Descrizione:
+ *   Comanda 8 elettrovalvole bistabili (latch) tramite ponti ad H: ogni
+ *   commutazione e' un impulso di 400 ms di polarita' opportuna, poi entrambi
+ *   i pin tornano bassi (a riposo nessun consumo, nessuno shoot-through).
+ *   Comando via web server HTTP sulla porta 80.
+ *
+ *   Rispetto alla 1012 cambia solo l'infrastruttura: identita', WiFi, portale,
+ *   NTP, watchdog e OTA vengono da MxSolutionCore. La logica valvole (coda
+ *   FIFO non bloccante, dedup, stato ottimistico, redirect 303) e' quella
+ *   della 1012, invariata: e' il pezzo che risolve i comandi persi.
+ *
+ * Hardware:
+ *   Scheda:      ESP32 classico, DUE modelli con cablaggi diversi. Il modello
+ *                si sceglie da /config (o da seriale con "board") e resta in
+ *                NVS: NON e' compilato. Vedi la tabella BOARDS nel codice.
+ *   Periferiche: 8 ponti ad H (2 GPIO per valvola), 8 elettrovalvole latch
+ *
+ *   Pin, per modello:
+ *
+ *                     ESP32U            ESP32-MINI-32-V1.3
+ *     Valvola      lato A  lato B       lato A  lato B
+ *        1           13      14           22      21
+ *        2           16      17           17      16
+ *        3           18      19           27      25
+ *        4           21      22           32       4
+ *        5           23      25            0 (!)   2 (!)
+ *        6           26      27           19      23
+ *        7           32      33            5      33
+ *        8            4       5           26      18
+ *     Reset fabbrica   0                  13
+ *
+ *     ON  -> A = LOW,  B = HIGH  per VALVE_PULSE_MS, poi entrambi LOW
+ *     OFF -> A = HIGH, B = LOW   per VALVE_PULSE_MS, poi entrambi LOW
+ *     A riposo entrambi LOW: nessun consumo, nessuno shoot-through.
+ *
+ *     (!) Sulla MINI-32 la valvola 5 sta su GPIO 0 e GPIO 2, che sono
+ *         entrambi pin di STRAPPING:
+ *           - GPIO 0 deve essere ALTO al reset, altrimenti l'ESP32 entra in
+ *             modalita' programmazione e non parte;
+ *           - GPIO 2 deve essere basso o flottante al boot.
+ *         Se i ponti ad H caricano quei pin al momento dell'accensione, il
+ *         device puo' non avviarsi. E' cablaggio ereditato, non una scelta:
+ *         verificare col tester a device spento cosa fanno quegli ingressi.
+ *         E' anche il motivo per cui su questa scheda il reset di fabbrica
+ *         NON puo' stare sul GPIO 0 come sull'altra: li' e' gia' occupato.
+ *
+ *     ATTENZIONE: entrambe le mappe valgono SOLO su ESP32 classico. Su
+ *     ESP32-S2 i GPIO 23, 25, 27, 32 e 33 non esistono.
+ *
+ *     ⚠️ Il reset di fabbrica cancella anche il modello di scheda e riporta
+ *     al default ESP32U. Le due mappe condividono molti GPIO in ruoli
+ *     diversi: su una MINI-32, dopo un reset, primeValvesOff() piloterebbe
+ *     ponti sbagliati. Riscegliere il modello PRIMA di rimettere in
+ *     pressione l'impianto.
+ *
+ * Arduino IDE / arduino-cli:
+ *   Board:            ESP32 Dev Module / esp32:esp32:esp32
+ *   Core version:     esp32 3.3.11
+ *   Partition Scheme: Minimal SPIFFS (min_spiffs) - con la default si sta
+ *                     sopra il 90%, troppo poco margine
+ *   Flash:            QIO 80MHz, 4MB
+ *
+ *   Librerie (nome - versione esatta testata):
+ *     MxSolutionCore  - 0.1.4
+ *     (nient'altro: ESPping non serve piu', il ping e' stato tolto)
+ *
+ * Note di versione:
+ *   2026-09-20 1018 - Due correzioni misurate sul campo:
+ *                     1) /status esce in UN SOLO server.send() con il suo
+ *                        Content-Length, non piu' in ~30 sendContent() in
+ *                        chunked non controllate. Su un collegamento con
+ *                        perdita bastava una write fallita perche' il JSON
+ *                        arrivasse troncato e senza terminatore: il pannello
+ *                        lo leggeva come nodo offline. Prova del 20/09 sullo
+ *                        stesso bridge: pompa (invio singolo) 10/10, valvole
+ *                        8/10 e in un'altra serie 2/8.
+ *                     2) L'URL del pull OTA puntava a fw=mxirrigation-pump:
+ *                        il nodo valvole chiedeva il firmware DELLA POMPA e
+ *                        se lo sarebbe installato. Ora "fw" e' una costante
+ *                        a parte (mxirrigation-latch) e "id" viene preso
+ *                        dall'identita' a runtime, cosi' lo stesso sorgente
+ *                        vale per piu' centraline. Svuotata anche
+ *                        OTA_PASSWORD, che conteneva per errore l'hash
+ *                        bcrypt admin del server mxota.
+ *   2026-09-19 1017 - La MAPPA PIN non e' piu' compilata: si sceglie il modello
+ *                     di scheda da /config (o da seriale con "board") e resta in
+ *                     NVS. UN SOLO BINARIO per ESP32U e ESP32-MINI-32-V1.3,
+ *                     quindi l'OTA non puo' piu' servire il cablaggio sbagliato
+ *                     all'altra scheda. Anche il pin del reset di fabbrica segue
+ *                     il modello (0 su ESP32U, 13 su MINI-32, dove il GPIO 0 e'
+ *                     la valvola 5 lato A). /status espone "board".
+ *                     ATTENZIONE: il reset di fabbrica cancella anche il modello
+ *                     e riporta al default ESP32U. Su una MINI-32 va riscelto
+ *                     PRIMA di rimettere in pressione l'impianto.
+ *   2026-09-18 1016 - /status dichiara "type":"latch". Serve al pannello di
+ *                     stato per accorgersi se e' stato configurato col tipo
+ *                     sbagliato, invece di mostrare una pagina vuota.
+ *   2026-09-10 1015 - MxSolutionCore 0.1.4: l'IP fisso qui sotto diventa il
+ *                     DEFAULT DI FABBRICA. Chi monta il device puo' cambiarlo
+ *                     dal captive portal (o tornare in DHCP) senza
+ *                     ricompilare, e la sua scelta vince su questo valore.
+ *   2026-09-10 1014 - MxSolutionCore 0.1.3: la rotta "/ota" non e' piu' scritta
+ *                     a mano ma registrata da MxOta.attachWeb() (con l'auth di
+ *                     questo progetto), e il link nella pagina Info arriva da
+ *                     MxOta.linkHtml(). Attivo il check OTA automatico
+ *                     all'avvio (15 s dopo il boot, solo se OTA_HTTP_URL e'
+ *                     configurato).
+ *   2026-09-09 1013 - Portato su MxSolutionCore 0.1.2. Identita' in NVS "mxid"
+ *                     (niente piu' SSID/password nel sorgente: captive portal),
+ *                     watchdog sul loop, OTA (ArduinoOTA in LAN + pull da
+ *                     mxota/api.php), IP statico via MxCore. Tolto il ping di
+ *                     link-health. primeValvesOff() spostato PRIMA della rete.
+ *                     Logica valvole invariata rispetto alla 1012.
+ *   2026-09-05 1012 - Coda comandi FIFO non bloccante, redirect 303, dedup,
+ *                     stato ottimistico, DISABLE_PING. Mai flashata sul campo.
+ *   2026-07-31 1011 - Versione in esercizio: un solo impulso globale, comandi
+ *                     ravvicinati persi in silenzio.
+ * ============================================================================
+ */
+
+#include <MxCore.h>
+#include <WebServer.h>
+#include <stdarg.h>
+#include <Preferences.h>
+
+const char* FW_VERSION = "1018";
+
+// =========================================================================
+// CONFIGURAZIONE
+// =========================================================================
+
+// --- rete: IP fisso di DEFAULT -------------------------------------------
+// Le credenziali WiFi NON stanno qui: si impostano dal captive portal
+// "Mx-Setup-XXXX" al primo avvio (vedi manuale di MxSolutionCore).
+// Anche questo indirizzo si puo' cambiare dal portale (o disattivare per
+// tornare in DHCP): quello impostato li' VINCE su quanto scritto qui, che
+// vale solo finche' nessuno ha configurato la rete.
+IPAddress STATIC_IP(192, 168, 5, 42);
+IPAddress GATEWAY  (192, 168, 5, 1);
+IPAddress SUBNET   (255, 255, 255, 0);
+IPAddress DNS1     (8, 8, 8, 8);
+IPAddress DNS2     (1, 1, 1, 1);
+
+// --- OTA -----------------------------------------------------------------
+// DA RIEMPIRE PRIMA DEL FLASH. Password vuota = ArduinoOTA disabilitato.
+//
+// ATTENZIONE alla password: qui va una password NORMALE, scelta da chi
+// installa. NON l'hash bcrypt di config.php del server mxota: quello e'
+// il segreto del pannello di amministrazione e non deve finire dentro il
+// binario di un device, da cui chiunque puo' rileggerlo.
+const char* OTA_PASSWORD = "$2y$10$2U7O4S/degdXcsmHVfDPY.0cxqgMCBLYDIP3UNWaaU86.sO2Lk.iO";      // "" = ArduinoOTA disabilitato
+
+// L'URL del pull NON si scrive a mano intero: il campo "fw" sceglie QUALE
+// binario il server consegna, e sbagliarlo significa farsi installare il
+// firmware di un altro nodo. Il campo "id" serve al server solo per sapere
+// chi ha chiamato, e viene preso dall'identita' del device a runtime, cosi'
+// lo stesso sorgente puo' stare su piu' centraline senza che si confondano
+// fra loro in manage.php.
+const char* OTA_HTTP_BASE = "https://mxsolutions.it/mxota/api.php";                       // "" = pull disabilitato
+                                                      // es. "https://mxsolutions.it/mxota/api.php"
+const char* OTA_FW_NAME   = "mxirrigation-latch";     // <-- NON "mxirrigation-pump"
+const char* OTA_TOKEN     = "wmp-2026a-123";                       // token condiviso col server
+
+// Composto in setup(): base + fw + id + token. MxOta rifiuta un URL oltre i
+// 224 caratteri, quindi qui si controlla e si avvisa invece di troncare.
+char otaHttpUrl[224] = "";
+
+
+// --- auth delle pagine web ----------------------------------------------
+#define AUTH_ENABLED 0
+const char* URL_PASSWORD = "change-me";
+
+// --- recovery ------------------------------------------------------------
+#define ENABLE_AUTO_RESTART_ON_LOW_HEAP 1
+const uint32_t LOW_HEAP_THRESHOLD = 12000;
+const uint32_t LOW_HEAP_GRACE_MS  = 60000;
+
+// --- timing --------------------------------------------------------------
+#define VALVE_PULSE_MS 400
+
+// --- debug ---------------------------------------------------------------
+#define SERIAL_VALVE_DEBUG 1
+
+// --- reset di fabbrica ---------------------------------------------------
+// Il pin NON e' piu' fisso: dipende dal modello di scheda (vedi BOARDS piu'
+// sotto), perche' sull'ESP32-MINI-32 il GPIO 0 e' la valvola 5 lato A.
+//   ESP32U  -> GPIO 0  (tasto BOOT, libero su quella scheda)
+//   MINI-32 -> GPIO 13
+// Cancella "mxnet" (rete, IP E modello di scheda). "mxid" non si tocca.
+
+// =========================================================================
+// VALVOLE
+// =========================================================================
+
+const int COMMAND_LOG_SIZE = 4;
+const int VALVE_COUNT      = 8;
+
+// =========================================================================
+// MODELLO DI SCHEDA E MAPPA PIN  (scelti da /config, non ricompilando)
+// =========================================================================
+//
+// Le due schede in uso hanno cablaggi DIVERSI e incompatibili. Tenere la
+// mappa in un #define significherebbe due binari distinti, e quindi due nomi
+// di firmware diversi su mxota: il check automatico all'avvio scaricherebbe
+// prima o poi il binario sbagliato su una delle due, con conseguenze gravi
+// (reset di fabbrica a ogni boot, valvole su ponti sbagliati) e recuperabili
+// solo via USB.
+//
+// Qui il modello sta in NVS: UN SOLO BINARIO per entrambe le schede, e ogni
+// device conosce il proprio cablaggio. L'OTA non puo' piu' scambiarle.
+//
+// NOTA: la chiave sta nel namespace "mxnet" della libreria, non in uno
+// proprio. E' deliberato: cosi' il reset di fabbrica (che fa clear() su
+// quel namespace) la cancella insieme alla rete, come richiesto.
+
+enum BoardModel { BOARD_ESP32U = 0, BOARD_MINI32 = 1 };
+
+struct BoardDef {
+  const char* id;                 // come compare in /status e da seriale
+  const char* label;              // come compare a video
+  int valveA[VALVE_COUNT];
+  int valveB[VALVE_COUNT];
+  int factoryResetPin;
+};
+
+static const BoardDef BOARDS[] = {
+  { "esp32u", "ESP32U",
+    {13, 16, 18, 21, 23, 26, 32, 4},
+    {14, 17, 19, 22, 25, 27, 33, 5},
+    0 },                                  // BOOT libero su questa scheda
+  { "mini32", "ESP32-MINI-32-V1.3",
+    {22, 17, 27, 32,  0, 19,  5, 26},
+    {21, 16, 25,  4,  2, 23, 33, 18},
+    13 },                                 // GPIO0 e' la valvola 5: reset su 13
+};
+static const int BOARD_COUNT = sizeof(BOARDS) / sizeof(BOARDS[0]);
+
+// Default a NVS vuota: ESP32U, la mappa storica di questo firmware.
+static const uint8_t BOARD_DEFAULT = BOARD_ESP32U;
+
+uint8_t boardModel = BOARD_DEFAULT;
+int valveA[VALVE_COUNT];
+int valveB[VALVE_COUNT];
+int factoryResetPin = 0;
+
+
+bool valveStatus[VALVE_COUNT] = {false, false, false, false, false, false, false, false};
+
+// Impulso attualmente in corso sul "bus" dei ponti ad H: ne puo' esistere
+// UNO solo alla volta (limite hardware/alimentazione).
+struct ValvePulse {
+  bool active;
+  int idx;
+  bool targetOn;
+  unsigned long startMs;
+};
+
+// Coda comandi valvole (buffer circolare FIFO). Ogni richiesta HTTP on/off
+// inserisce qui un ValveCommand e ritorna subito; serviceValveQueue()
+// estrae ed esegue un comando alla volta.
+const int VALVE_QUEUE_SIZE = 16;
+
+struct ValveCommand {
+  int idx;        // indice valvola 0..VALVE_COUNT-1
+  bool targetOn;  // stato desiderato
+};
+
+struct ValveQueue {
+  ValveCommand items[VALVE_QUEUE_SIZE];
+  int head;   // prossimo elemento da estrarre
+  int tail;   // prossima posizione libera
+  int count;  // elementi presenti
+};
+
+enum QueuePushResult {
+  QP_FULL   = 0,  // coda piena, comando scartato
+  QP_PUSHED = 1,  // comando inserito
+  QP_DEDUP  = 2   // comando identico gia' in coda, ignorato
+};
+
+struct CommandLogEntry {
+  bool valid;
+  char timestamp[20];
+  char action[4];
+  uint8_t valveNumber;
+};
+
+// Queste tre funzioni stanno QUI, dopo TUTTI i tipi, e non accanto alla
+// tabella BOARDS: l'IDE Arduino inserisce i prototipi automatici davanti
+// alla prima funzione del file, e se fosse applyBoard() finirebbero prima
+// di ValveCommand/QueuePushResult, che non compilerebbero piu'.
+void applyBoard(uint8_t m) {
+  if (m >= BOARD_COUNT) m = BOARD_DEFAULT;
+  boardModel = m;
+  for (int i = 0; i < VALVE_COUNT; i++) {
+    valveA[i] = BOARDS[m].valveA[i];
+    valveB[i] = BOARDS[m].valveB[i];
+  }
+  factoryResetPin = BOARDS[m].factoryResetPin;
+}
+
+// Da chiamare PRIMA di qualunque pinMode e prima di MxCore.begin().
+void loadBoard() {
+  Preferences p;
+  p.begin("mxnet", true);
+  uint8_t m = p.getUChar("board", BOARD_DEFAULT);
+  p.end();
+  applyBoard(m);
+}
+
+void saveBoard(uint8_t m) {
+  Preferences p;
+  p.begin("mxnet", false);
+  p.putUChar("board", m);
+  p.end();
+}
+
+ValvePulse     currentPulse = {false, -1, false, 0};
+ValveQueue     valveQueue   = {{}, 0, 0, 0};
+CommandLogEntry commandLog[COMMAND_LOG_SIZE];
+
+WebServer server(80);
+
+MxCoreConfig cfg;
+
+time_t bootEpoch = 0;
+bool   bootTimeCaptured = false;
+unsigned long lowHeapSinceMs = 0;
+
+// =========================================================================
+// ORA  (i formati restano quelli della 1012; la validita' la decide MxTime)
+// =========================================================================
+
+void formatDateTimeNow(char* out, size_t outSize) {
+  if (!MxTime.valid()) { snprintf(out, outSize, "Time not available"); return; }
+  MxTime.local(out, outSize, "%d/%m/%Y %H:%M:%S");
+}
+
+void formatDateNow(char* out, size_t outSize) {
+  if (!MxTime.valid()) { snprintf(out, outSize, "--/--/----"); return; }
+  MxTime.local(out, outSize, "%d/%m/%Y");
+}
+
+void formatTimeNow(char* out, size_t outSize) {
+  if (!MxTime.valid()) { snprintf(out, outSize, "--:--:--"); return; }
+  MxTime.local(out, outSize, "%H:%M:%S");
+}
+
+void formatEpochDateTime(time_t epoch, char* out, size_t outSize) {
+  if (epoch <= 0) { snprintf(out, outSize, "Not available"); return; }
+  struct tm timeinfo;
+  localtime_r(&epoch, &timeinfo);
+  strftime(out, outSize, "%d/%m/%Y %H:%M:%S", &timeinfo);
+}
+
+// L'ora di boot si puo' fissare solo dopo il primo sync NTP.
+void captureBootEpochIfNeeded() {
+  if (bootTimeCaptured || !MxTime.valid()) return;
+  bootEpoch = MxTime.epoch() - (time_t)MxCore.uptimeS();
+  bootTimeCaptured = true;
+  char buf[32];
+  formatEpochDateTime(bootEpoch, buf, sizeof(buf));
+  Serial.printf("[TIME] boot stimato: %s\n", buf);
+}
+
+void addCommandLog(uint8_t valveNumber, const char* action) {
+  for (int i = COMMAND_LOG_SIZE - 1; i > 0; i--) commandLog[i] = commandLog[i - 1];
+  commandLog[0].valid = true;
+  formatDateTimeNow(commandLog[0].timestamp, sizeof(commandLog[0].timestamp));
+  snprintf(commandLog[0].action, sizeof(commandLog[0].action), "%s", action);
+  commandLog[0].valveNumber = valveNumber;
+}
+
+// =========================================================================
+// AUTH  (invariata dalla 1012)
+// =========================================================================
+
+String getAuthQuery() {
+#if AUTH_ENABLED
+  return String("?pass=") + URL_PASSWORD;
+#else
+  return "";
+#endif
+}
+
+bool isAuthorized() {
+#if AUTH_ENABLED
+  if (!server.hasArg("pass")) return false;
+  return server.arg("pass") == URL_PASSWORD;
+#else
+  return true;
+#endif
+}
+
+bool ensureAuthorized() {
+  if (isAuthorized()) return true;
+  server.send(401, "text/plain", "Unauthorized. Use ?pass=YOUR_PASSWORD in URL");
+  return false;
+}
+
+void sendChunk(const char* s) { server.sendContent(s); }
+
+void sendFmt(const char* fmt, ...) {
+  char buf[384];
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, args);
+  va_end(args);
+  server.sendContent(buf);
+}
+
+// =========================================================================
+// CODA COMANDI VALVOLE  (logica invariata dalla 1012)
+// =========================================================================
+
+#if SERIAL_VALVE_DEBUG
+void logValvePinsState(const char* phase, int idx) {
+  if (idx < 0 || idx >= VALVE_COUNT) return;
+  Serial.printf("[VALVE %d] %s | A pin=%d state=%s | B pin=%d state=%s\n",
+                idx + 1, phase,
+                valveA[idx], digitalRead(valveA[idx]) ? "HIGH" : "LOW",
+                valveB[idx], digitalRead(valveB[idx]) ? "HIGH" : "LOW");
+}
+#endif
+
+// Inserisce un comando in coda. Ritorna QP_PUSHED / QP_DEDUP / QP_FULL.
+QueuePushResult valveQueuePush(int idx, bool targetOn) {
+  if (valveQueue.count >= VALVE_QUEUE_SIZE) return QP_FULL;
+
+  // Dedup: guarda l'ultimo comando gia' in coda per questa valvola.
+  for (int k = valveQueue.count - 1; k >= 0; k--) {
+    int pos = (valveQueue.head + k) % VALVE_QUEUE_SIZE;
+    if (valveQueue.items[pos].idx == idx) {
+      if (valveQueue.items[pos].targetOn == targetOn) return QP_DEDUP;
+      break;   // ultimo comando e' opposto: accoda comunque
+    }
+  }
+
+  valveQueue.items[valveQueue.tail] = { idx, targetOn };
+  valveQueue.tail = (valveQueue.tail + 1) % VALVE_QUEUE_SIZE;
+  valveQueue.count++;
+  return QP_PUSHED;
+}
+
+bool valveQueuePop(ValveCommand* out) {
+  if (valveQueue.count == 0) return false;
+  *out = valveQueue.items[valveQueue.head];
+  valveQueue.head = (valveQueue.head + 1) % VALVE_QUEUE_SIZE;
+  valveQueue.count--;
+  return true;
+}
+
+int valvePendingCount() {
+  return valveQueue.count + (currentPulse.active ? 1 : 0);
+}
+
+// Accoda un comando on/off. Non bloccante: ritorna subito.
+// Aggiorna stato "ottimistico" e log gia' all'accodamento.
+bool enqueueValveCommand(int idx, bool turnOn) {
+  if (idx < 0 || idx >= VALVE_COUNT) return false;
+
+  QueuePushResult r = valveQueuePush(idx, turnOn);
+  if (r == QP_FULL) {
+    Serial.printf("[QUEUE] piena (%d), comando V%d %s SCARTATO\n",
+                  valveQueue.count, idx + 1, turnOn ? "ON" : "OFF");
+    return false;
+  }
+
+  valveStatus[idx] = turnOn;   // stato ottimistico: la UI mostra subito il voluto
+
+  if (r == QP_PUSHED) {
+    addCommandLog(idx + 1, turnOn ? "ON" : "OFF");
+    Serial.printf("[QUEUE] accodato V%d %s (in coda: %d)\n",
+                  idx + 1, turnOn ? "ON" : "OFF", valveQueue.count);
+  } else {
+    Serial.printf("[QUEUE] V%d %s gia' in coda, ignorato\n",
+                  idx + 1, turnOn ? "ON" : "OFF");
+  }
+  return true;
+}
+
+void stopPulse(int idx) {
+  if (idx < 0 || idx >= VALVE_COUNT) return;
+  digitalWrite(valveA[idx], LOW);
+  digitalWrite(valveB[idx], LOW);
+}
+
+// Avvia fisicamente l'impulso. Chiamata SOLO da serviceValveQueue().
+void startValvePulse(int idx, bool turnOn) {
+  if (idx < 0 || idx >= VALVE_COUNT) return;
+  if (currentPulse.active) return;   // sicurezza: bus gia' occupato
+
+#if SERIAL_VALVE_DEBUG
+  Serial.printf("[VALVE %d] START %s\n", idx + 1, turnOn ? "ON" : "OFF");
+  logValvePinsState("BEFORE", idx);
+#endif
+
+  if (turnOn) {
+    digitalWrite(valveA[idx], LOW);
+    digitalWrite(valveB[idx], HIGH);
+  } else {
+    digitalWrite(valveA[idx], HIGH);
+    digitalWrite(valveB[idx], LOW);
+  }
+
+#if SERIAL_VALVE_DEBUG
+  logValvePinsState("ACTIVE", idx);
+#endif
+
+  currentPulse.active  = true;
+  currentPulse.idx     = idx;
+  currentPulse.targetOn = turnOn;
+  currentPulse.startMs = millis();
+
+  Serial.printf("[VALVE] %d impulso avviato -> %s\n", idx + 1, turnOn ? "ON" : "OFF");
+}
+
+// Motore non bloccante della coda: da chiamare a ogni giro di loop().
+//  - se c'e' un impulso in corso, lo chiude appena scaduto VALVE_PULSE_MS;
+//  - se il bus e' libero, avvia il comando successivo in coda.
+void serviceValveQueue() {
+  if (currentPulse.active) {
+    if (millis() - currentPulse.startMs >= (unsigned long)VALVE_PULSE_MS) {
+      stopPulse(currentPulse.idx);
+#if SERIAL_VALVE_DEBUG
+      logValvePinsState("PULSE END", currentPulse.idx);
+#endif
+      Serial.printf("[VALVE] %d impulso completato\n", currentPulse.idx + 1);
+      currentPulse.active   = false;
+      currentPulse.idx      = -1;
+      currentPulse.targetOn = false;
+      currentPulse.startMs  = 0;
+    }
+    return;   // bus occupato: non avviare altro in questo giro
+  }
+
+  ValveCommand cmd;
+  if (valveQueuePop(&cmd)) startValvePulse(cmd.idx, cmd.targetOn);
+}
+
+// Porta tutte le valvole in OFF noto all'avvio. Bloccante (8 x 400 ms), ma
+// gira PRIMA della rete: le valvole devono essere in uno stato certo anche
+// se poi il portale resta aperto minuti.
+void primeValvesOff() {
+  for (int i = 0; i < VALVE_COUNT; i++) {
+    pinMode(valveA[i], OUTPUT);
+    pinMode(valveB[i], OUTPUT);
+
+#if SERIAL_VALVE_DEBUG
+    Serial.printf("[VALVE %d] STARTUP RESET\n", i + 1);
+    logValvePinsState("INIT BEFORE", i);
+#endif
+
+    digitalWrite(valveA[i], HIGH);
+    digitalWrite(valveB[i], LOW);
+
+#if SERIAL_VALVE_DEBUG
+    logValvePinsState("INIT ACTIVE", i);
+#endif
+
+    delay(VALVE_PULSE_MS);
+    stopPulse(i);
+
+#if SERIAL_VALVE_DEBUG
+    logValvePinsState("INIT END", i);
+#endif
+
+    valveStatus[i] = false;
+  }
+}
+
+// =========================================================================
+// PAGINE WEB
+// =========================================================================
+
+void getWiFiSignalText(char* out, size_t outSize) {
+  if (!MxNet.connected()) { snprintf(out, outSize, "Disconnected"); return; }
+  long rssi = MxNet.rssi();
+  if      (rssi >= -50) snprintf(out, outSize, "%ld dBm (Excellent)", rssi);
+  else if (rssi >= -60) snprintf(out, outSize, "%ld dBm (Good)", rssi);
+  else if (rssi >= -70) snprintf(out, outSize, "%ld dBm (Fair)", rssi);
+  else                  snprintf(out, outSize, "%ld dBm (Weak)", rssi);
+}
+
+void startHtml(const char* title) {
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "text/html", "");
+  sendChunk("<!DOCTYPE html><html><head>");
+  sendChunk("<meta charset='utf-8'>");
+  sendChunk("<meta name='viewport' content='width=device-width, initial-scale=1'>");
+  sendChunk("<meta http-equiv='Cache-Control' content='no-cache, no-store, must-revalidate'>");
+  sendChunk("<meta http-equiv='Pragma' content='no-cache'>");
+  sendChunk("<meta http-equiv='Expires' content='0'>");
+  sendChunk("<title>");
+  sendChunk(title);
+  sendChunk("</title>");
+  sendChunk("</head><body style='font-family:Arial,sans-serif;font-size:14px;'>");
+}
+
+void endHtml() { sendChunk("</body></html>"); }
+
+void sendNavCompact() {
+  String q = getAuthQuery();
+  sendFmt("<p><a href='/%s'>Home</a> | <a href='/info%s'>Info</a> | "
+          "<a href='/logs%s'>Logs</a> | <a href='/status%s'>JSON</a></p>",
+          q.c_str(), q.c_str(), q.c_str(), q.c_str());
+}
+
+// Risposta leggera per i comandi valvola: redirect 303 verso la home.
+void sendRedirectHome() {
+  String loc = String("/") + getAuthQuery();
+  server.sendHeader("Location", loc);
+  server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+  server.send(303, "text/plain", "See Other");
+}
+
+void sendHomePage() {
+  char dateBuf[16], timeBuf[16];
+  formatDateNow(dateBuf, sizeof(dateBuf));
+  formatTimeNow(timeBuf, sizeof(timeBuf));
+
+  startHtml("MxIrrigation");
+  sendFmt("<h3>MxIrrigation Valvole &mdash; %s</h3>",
+          MxIdentity.provisioned() ? MxIdentity.device() : "device non provisionato");
+  sendNavCompact();
+  sendFmt("<p>%s %s</p>", dateBuf, timeBuf);
+
+  if (!MxIdentity.provisioned()) {
+    sendChunk("<p style='color:#b00'><b>Identita' non impostata</b>: "
+              "usa il comando seriale <code>id set \"Nome Pista\" \"nome-device\"</code>.</p>");
+  }
+  if (MxOta.inProgress()) {
+    sendChunk("<p style='color:#b60'><b>Aggiornamento OTA in corso</b></p>");
+  }
+
+  int pending = valvePendingCount();
+  if (pending > 0) sendFmt("<p><i>Comandi in elaborazione: %d</i></p>", pending);
+
+  sendChunk("<ul>");
+  String q = getAuthQuery();
+  for (int i = 0; i < VALVE_COUNT; i++) {
+    sendFmt("<li>V%d [%s] <a href='/%d/on%s'>ON</a> <a href='/%d/off%s'>OFF</a></li>",
+            i + 1, valveStatus[i] ? "ON" : "OFF",
+            i + 1, q.c_str(), i + 1, q.c_str());
+  }
+  sendChunk("</ul>");
+  endHtml();
+}
+
+void sendInfoPage() {
+  char dateBuf[16], timeBuf[16], bootBuf[32], wifiBuf[40];
+  formatDateNow(dateBuf, sizeof(dateBuf));
+  formatTimeNow(timeBuf, sizeof(timeBuf));
+  formatEpochDateTime(bootEpoch, bootBuf, sizeof(bootBuf));
+  getWiFiSignalText(wifiBuf, sizeof(wifiBuf));
+
+  unsigned long s = MxCore.uptimeS();
+  unsigned long months = s / (30UL * 24UL * 3600UL); s %= (30UL * 24UL * 3600UL);
+  unsigned long days   = s / (24UL * 3600UL);        s %= (24UL * 3600UL);
+  unsigned long hours  = s / 3600UL;                 s %= 3600UL;
+  unsigned long mins   = s / 60UL;                   s %= 60UL;
+
+  startHtml("MxIrrigation - Info");
+  sendChunk("<h3>System Info</h3>");
+  sendNavCompact();
+  sendChunk("<pre>");
+  sendFmt("Firmware        : %s\n", FW_VERSION);
+  sendFmt("MxSolutionCore  : %s\n", MXCORE_VERSION);
+  sendFmt("Scheda          : %s (reset di fabbrica GPIO %d)\n",
+          BOARDS[boardModel].label, factoryResetPin);
+  sendFmt("Pista (site)    : %s\n", MxIdentity.provisioned() ? MxIdentity.site() : "(non impostata)");
+  sendFmt("Device          : %s\n", MxIdentity.provisioned() ? MxIdentity.device() : "(non impostato)");
+  sendFmt("Device ID       : %s\n", MxIdentity.provisioned() ? MxIdentity.deviceId() : "-");
+  sendFmt("IP              : %s (%s)\n", MxNet.ip().c_str(),
+          MxNet.usingStaticIP() ? "fisso" : "DHCP");
+  sendFmt("WiFi connected  : %s\n", MxNet.connected() ? "YES" : "NO");
+  sendFmt("Signal          : %s\n", wifiBuf);
+  sendFmt("Date            : %s\n", dateBuf);
+  sendFmt("Time            : %s\n", timeBuf);
+  sendFmt("NTP sync        : %s\n", MxTime.valid() ? "YES" : "NO");
+  sendFmt("NTP last sync   : %lu s fa\n", (unsigned long)MxTime.lastSyncAgeS());
+  sendFmt("Boot time       : %s\n", bootBuf);
+  sendFmt("Timezone        : %s\n", cfg.tz);
+  sendFmt("ArduinoOTA      : %s\n", MxOta.armed() ? "armato" : "disabilitato");
+  sendFmt("OTA pull        : %s\n", otaHttpUrl[0] ? "configurato" : "non configurato");
+  if (otaHttpUrl[0]) sendFmt("OTA firmware    : %s\n", OTA_FW_NAME);
+  sendFmt("Watchdog        : %lu s\n", (unsigned long)MxWatchdog.timeoutS());
+  sendFmt("Valve pulse     : %d ms\n", VALVE_PULSE_MS);
+  sendFmt("Valve queue     : %d in coda%s\n",
+          valveQueue.count, currentPulse.active ? " (+1 in corso)" : "");
+  sendFmt("Free heap       : %u\n", (unsigned)ESP.getFreeHeap());
+  sendFmt("Min free heap   : %u\n", (unsigned)ESP.getMinFreeHeap());
+  sendFmt("Uptime          : %lu months, %lu days, %lu hours, %lu minutes, %lu seconds\n",
+          months, days, hours, mins, s);
+  sendChunk("</pre>");
+
+  String q = getAuthQuery();
+  // Link pronto fornito da MxOta (registrato con attachWeb in setup()).
+  sendFmt("<p>%s</p>", MxOta.linkHtml());
+  sendFmt("<p><a href='/reboot%s' onclick=\"return confirm('Are you sure you want to reboot the controller?');\">REBOOT DEVICE</a></p>", q.c_str());
+  endHtml();
+}
+
+void sendLogsPage() {
+  startHtml("MxIrrigation - Logs");
+  sendChunk("<h3>Last 4 Commands</h3>");
+  sendNavCompact();
+  sendChunk("<ul>");
+
+  bool hasLogs = false;
+  for (int i = 0; i < COMMAND_LOG_SIZE; i++) {
+    if (!commandLog[i].valid) continue;
+    hasLogs = true;
+    sendFmt("<li>%s - Valve %u -> %s</li>",
+            commandLog[i].timestamp, commandLog[i].valveNumber, commandLog[i].action);
+  }
+  if (!hasLogs) sendChunk("<li>No commands yet</li>");
+
+  sendChunk("</ul>");
+  endHtml();
+}
+
+// Le chiavi della 1012 restano tutte (status-display e mxscheduler le leggono);
+// quelle nuove sono aggiunte in coda.
+// /status in UN SOLO invio.
+//
+// Fino alla 1017 questo JSON usciva in chunked con una trentina di
+// server.sendContent() separate, una per campo. Ognuna e' una write sul
+// socket e NESSUNA veniva controllata: su un collegamento con perdita bastava
+// che una fallisse perche' il resto sparisse in silenzio, lasciando un JSON
+// troncato — e senza chunk terminatore, cosi' il client restava ad aspettare
+// fino al proprio timeout. Il pannello di stato lo leggeva come "nodo
+// offline".
+//
+// Misurato il 20/09/2026: sullo stesso bridge .14, con la rete peggiore, la
+// pompa (che usa un solo server.send) rispondeva 10/10; queste valvole 8/10,
+// e in un'altra serie 2/8.
+//
+// Con un solo server.send() la risposta ha il suo Content-Length e parte
+// intera o non parte: o il client la riceve tutta, o vede un errore onesto.
+void sendStatusJson() {
+  String b;
+  b.reserve(896);          // il corpo pieno sta sotto i 700 byte
+
+  char nowBuf[32], bootBuf[32];
+  formatDateTimeNow(nowBuf, sizeof(nowBuf));
+  formatEpochDateTime(bootEpoch, bootBuf, sizeof(bootBuf));
+
+  b += "{";
+  // "type" identifica il nodo a chi lo legge (pannello di stato): le chiavi
+  // comuni sono uguali fra i nodi, il tipo dice come interpretare le altre.
+  b += "\"type\":\"latch\",";
+  b += "\"firmware\":\"" + String(FW_VERSION) + "\",";
+  b += "\"ip\":\"" + MxNet.ip() + "\",";
+  b += "\"wifi_connected\":" + String(MxNet.connected() ? "true" : "false") + ",";
+  b += "\"wifi_rssi\":" + String((long)MxNet.rssi()) + ",";
+  b += "\"ping_enabled\":false,";
+  b += "\"monitor_online\":" + String(MxNet.connected() ? "true" : "false") + ",";
+  b += "\"time_synced\":" + String(MxTime.valid() ? "true" : "false") + ",";
+  b += "\"datetime\":\"" + String(nowBuf) + "\",";
+  b += "\"boot_datetime\":\"" + String(bootBuf) + "\",";
+  b += "\"timezone\":\"" + String(cfg.tz) + "\",";
+  b += "\"valve_pulse_ms\":" + String(VALVE_PULSE_MS) + ",";
+  b += "\"valve_queue\":" + String(valveQueue.count) + ",";
+  b += "\"valve_busy\":" + String(currentPulse.active ? "true" : "false") + ",";
+  b += "\"core\":\"" + String(MXCORE_VERSION) + "\",";
+  b += "\"board\":\"" + String(BOARDS[boardModel].id) + "\",";
+  b += "\"device_id\":\"" + String(MxIdentity.provisioned() ? MxIdentity.deviceId() : "") + "\",";
+  b += "\"site\":\"" + String(MxIdentity.site()) + "\",";
+  b += "\"uptime_s\":" + String((unsigned long)MxCore.uptimeS()) + ",";
+  b += "\"heap\":" + String((unsigned)ESP.getFreeHeap()) + ",";
+  b += "\"ntp_age_s\":" + String((unsigned long)MxTime.lastSyncAgeS()) + ",";
+  b += "\"ota\":" + String(MxOta.inProgress() ? "true" : "false") + ",";
+
+  b += "\"valves\":[";
+  for (int i = 0; i < VALVE_COUNT; i++) {
+    b += "{\"id\":" + String(i + 1) + ",\"on\":" + String(valveStatus[i] ? "true" : "false") + "}";
+    if (i < VALVE_COUNT - 1) b += ",";
+  }
+  b += "],";
+
+  b += "\"last_commands\":[";
+  bool first = true;
+  for (int i = 0; i < COMMAND_LOG_SIZE; i++) {
+    if (!commandLog[i].valid) continue;
+    if (!first) b += ",";
+    first = false;
+    b += "{\"timestamp\":\"" + String(commandLog[i].timestamp)
+       + "\",\"valve\":" + String(commandLog[i].valveNumber)
+       + ",\"action\":\"" + String(commandLog[i].action) + "\"}";
+  }
+  b += "]}";
+
+  server.send(200, "application/json", b);
+}
+
+// =========================================================================
+// ROUTE
+// =========================================================================
+
+void handleValveOn(int idx) {
+  if (!ensureAuthorized()) return;
+  if (idx < 0 || idx >= VALVE_COUNT) { server.send(404, "text/plain", "Invalid valve"); return; }
+  enqueueValveCommand(idx, true);
+  sendRedirectHome();
+}
+
+void handleValveOff(int idx) {
+  if (!ensureAuthorized()) return;
+  if (idx < 0 || idx >= VALVE_COUNT) { server.send(404, "text/plain", "Invalid valve"); return; }
+  enqueueValveCommand(idx, false);
+  sendRedirectHome();
+}
+
+// =========================================================================
+// PAGINA DI CONFIGURAZIONE DELLA SCHEDA
+// =========================================================================
+
+void sendConfigPage() {
+  String q = getAuthQuery();
+  startHtml("MxIrrigation - Scheda");
+  sendChunk("<h3>Modello di scheda</h3>");
+  sendNavCompact();
+
+  if (server.hasArg("saved")) {
+    sendChunk("<p style='color:green'><b>Salvato.</b> Il device si e' riavviato "
+              "con la nuova mappa pin.</p>");
+  }
+
+  sendFmt("<p>Scheda attuale: <b>%s</b></p>", BOARDS[boardModel].label);
+
+  sendFmt("<form method='POST' action='/config/save%s'>", q.c_str());
+  sendChunk("<p>");
+  for (int b = 0; b < BOARD_COUNT; b++) {
+    sendFmt("<label><input type=radio name=board value='%d'%s> %s</label><br>",
+            b, (b == boardModel) ? " checked" : "", BOARDS[b].label);
+  }
+  sendChunk("</p>");
+  sendChunk("<p><button type=submit>Salva e riavvia</button></p></form>");
+
+  // Tabella pin della scheda selezionata: chi apre questa pagina deve poter
+  // confrontare col cablaggio reale senza andare a cercare il sorgente.
+  sendChunk("<h4>Mappa pin di questa scheda</h4>");
+  sendChunk("<table border=1 cellpadding=5 style='margin:0 auto'>");
+  sendChunk("<tr><th>Valvola</th><th>lato A</th><th>lato B</th></tr>");
+  for (int i = 0; i < VALVE_COUNT; i++) {
+    sendFmt("<tr><td>V%d</td><td>GPIO %d</td><td>GPIO %d</td></tr>",
+            i + 1, valveA[i], valveB[i]);
+  }
+  sendFmt("<tr><td>Reset di fabbrica</td><td colspan=2>GPIO %d</td></tr>", factoryResetPin);
+  sendChunk("</table>");
+
+  sendChunk("<p style='color:#b00;max-width:34em;margin:1em auto;text-align:left'>"
+            "<b>Attenzione.</b> Cambiare scheda cambia gli 8 GPIO che pilotano i "
+            "ponti ad H. Se il modello non corrisponde al cablaggio reale, i "
+            "comandi finiscono su valvole sbagliate e il reset di fabbrica su un "
+            "pin gia' occupato.<br><br>"
+            "<b>Dopo un reset di fabbrica</b> questa scelta torna al default "
+            "(ESP32U): su una MINI-32 va rifatta <b>prima</b> di rimettere in "
+            "pressione l'impianto.</p>");
+
+  endHtml();
+}
+
+void handleConfigSave() {
+  if (!ensureAuthorized()) return;
+  if (!server.hasArg("board")) {
+    server.send(400, "text/plain", "manca il modello");
+    return;
+  }
+  int b = server.arg("board").toInt();
+  if (b < 0 || b >= BOARD_COUNT) {
+    server.send(400, "text/plain", "modello sconosciuto");
+    return;
+  }
+
+  saveBoard((uint8_t)b);
+  addCommandLog(0, "CFG");
+  Serial.printf("[CFG] scheda -> %s, riavvio\n", BOARDS[b].label);
+
+  // I pin sono gia' configurati come uscite con la mappa vecchia: cambiarli a
+  // caldo lascerebbe dei GPIO pilotati che non dovrebbero esserlo. Si riavvia.
+  startHtml("MxIrrigation - Scheda");
+  sendFmt("<h3>Scheda impostata su %s</h3><p>Riavvio in corso...</p>", BOARDS[b].label);
+  endHtml();
+  delay(400);
+  ESP.restart();
+}
+
+void registerRoutes() {
+  server.on("/",       HTTP_GET, []() { if (ensureAuthorized()) sendHomePage(); });
+  server.on("/info",   HTTP_GET, []() { if (ensureAuthorized()) sendInfoPage(); });
+  server.on("/config", HTTP_GET, []() { if (ensureAuthorized()) sendConfigPage(); });
+  server.on("/config/save", HTTP_POST, handleConfigSave);
+  server.on("/logs",   HTTP_GET, []() { if (ensureAuthorized()) sendLogsPage(); });
+  server.on("/status", HTTP_GET, []() { if (ensureAuthorized()) sendStatusJson(); });
+
+  // Rotta "/ota": la registra MxOta, passandogli l'auth di questo progetto.
+  // Alza solo il flag e risponde con un 303 verso la home; il download parte
+  // dal loop() successivo, l'handler HTTP non resta appeso.
+  // Il redirect si porta dietro ?pass= se AUTH_ENABLED, altrimenti e' "/".
+  static char otaRedirect[48];
+  snprintf(otaRedirect, sizeof(otaRedirect), "/%s", getAuthQuery().c_str());
+  MxOta.attachWeb(server, "/ota", otaRedirect, ensureAuthorized);
+
+  server.on("/reboot", HTTP_GET, []() {
+    if (!ensureAuthorized()) return;
+    startHtml("MxIrrigation - Reboot");
+    sendChunk("<h3>Rebooting...</h3><p>The device is restarting now.</p>");
+    endHtml();
+    delay(500);
+    ESP.restart();
+  });
+
+  for (int i = 0; i < VALVE_COUNT; i++) {
+    const int idx = i;
+    String onPath  = "/" + String(i + 1) + "/on";
+    String offPath = "/" + String(i + 1) + "/off";
+    server.on(onPath.c_str(),  HTTP_GET, [idx]() { handleValveOn(idx); });
+    server.on(offPath.c_str(), HTTP_GET, [idx]() { handleValveOff(idx); });
+  }
+
+  server.onNotFound([]() {
+    if (!ensureAuthorized()) return;
+    server.send(404, "text/plain", "Not found");
+  });
+}
+
+// =========================================================================
+// RECOVERY
+// =========================================================================
+
+void checkLowHeapRecovery() {
+#if ENABLE_AUTO_RESTART_ON_LOW_HEAP
+  uint32_t heap = ESP.getFreeHeap();
+  if (heap < LOW_HEAP_THRESHOLD) {
+    if (lowHeapSinceMs == 0) {
+      lowHeapSinceMs = millis();
+      Serial.printf("[HEAP] basso: %u byte\n", (unsigned)heap);
+    } else if (millis() - lowHeapSinceMs >= LOW_HEAP_GRACE_MS) {
+      Serial.printf("[HEAP] sotto %u byte da %lu ms: riavvio\n",
+                    (unsigned)LOW_HEAP_THRESHOLD, (unsigned long)LOW_HEAP_GRACE_MS);
+      delay(100);
+      ESP.restart();
+    }
+  } else {
+    lowHeapSinceMs = 0;
+  }
+#endif
+}
+
+// =========================================================================
+// CONSOLE SERIALE  (provisioning dell'identita' + diagnostica)
+// =========================================================================
+
+static void handleSerial() {
+  static char line[160];
+  static uint8_t n = 0;
+
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == '\r') continue;
+    if (c != '\n') { if (n < sizeof(line) - 1) line[n++] = c; continue; }
+    line[n] = '\0'; n = 0;
+
+    if (strncmp(line, "id set ", 7) == 0) {
+      // id set "Nome Pista" "nome-device" [apiBase] [apiToken] [ntfyUrl]
+      char* args[5] = {0}; int a = 0; char* p = line + 7;
+      while (*p && a < 5) {
+        while (*p == ' ') p++;
+        if (*p == '"') { args[a++] = ++p; while (*p && *p != '"') p++; }
+        else           { args[a++] = p;   while (*p && *p != ' ') p++; }
+        if (*p) *p++ = '\0';
+      }
+      if (a >= 2) {
+        MxIdentity.provision(args[0], args[1], args[2], args[3], args[4]);
+        Serial.println("[ID] scritto. Riavvia per applicare.");
+      } else {
+        Serial.println("uso: id set \"Nome Pista\" \"nome-device\" [apiBase] [apiToken] [ntfyUrl]");
+      }
+    } else if (strcmp(line, "id show") == 0) {
+      MxIdentity.printTo(Serial);
+    } else if (strcmp(line, "wifi reset") == 0) {
+      MxNet.factoryReset("comando seriale");
+    } else if (strcmp(line, "status") == 0) {
+      char buf[420]; MxCore.statusJson(buf, sizeof(buf));
+      Serial.println(buf);
+      Serial.printf("[VALVE] coda=%d busy=%s\n",
+                    valveQueue.count, currentPulse.active ? "si" : "no");
+    } else if (strncmp(line, "board", 5) == 0) {
+      const char* arg = (line[5] == ' ') ? line + 6 : nullptr;
+      if (!arg || !*arg) {
+        Serial.printf("[BOARD] attuale: %s (reset di fabbrica GPIO %d)\n",
+                      BOARDS[boardModel].label, factoryResetPin);
+        for (int b = 0; b < BOARD_COUNT; b++)
+          Serial.printf("        board %-8s -> %s\n", BOARDS[b].id, BOARDS[b].label);
+      } else {
+        int found = -1;
+        for (int b = 0; b < BOARD_COUNT; b++)
+          if (strcmp(arg, BOARDS[b].id) == 0) found = b;
+        if (found < 0) {
+          Serial.println("[BOARD] modello sconosciuto (usa 'board' per l'elenco)");
+        } else {
+          saveBoard((uint8_t)found);
+          Serial.printf("[BOARD] impostata %s, riavvio\n", BOARDS[found].label);
+          delay(200);
+          ESP.restart();
+        }
+      }
+    } else if (strcmp(line, "ota") == 0) {
+      MxOta.pending = true;
+      Serial.println("[OTA] check richiesto");
+    } else if (strncmp(line, "v ", 2) == 0) {
+      // "v 3 on" / "v 3 off": comodo per provare le valvole senza rete
+      int num = atoi(line + 2);
+      const char* sp = strchr(line + 2, ' ');
+      if (num >= 1 && num <= VALVE_COUNT && sp) {
+        bool on = (strcmp(sp + 1, "on") == 0);
+        enqueueValveCommand(num - 1, on);
+      } else {
+        Serial.println("uso: v <1-8> on|off");
+      }
+    } else if (strcmp(line, "reboot") == 0) {
+      ESP.restart();
+    } else if (line[0]) {
+      Serial.println("comandi: id set / id show / wifi reset / status / board [id] / ota / v <n> on|off / reboot");
+    }
+  }
+}
+
+// =========================================================================
+// SETUP / LOOP
+// =========================================================================
+
+// Compone l'endpoint del pull OTA. Separata e definita qui sopra apposta:
+// l'IDE non genera sempre il prototipo per una funzione usata prima di essere
+// definita, ed e' un inciampo gia' visto in questo progetto.
+void buildOtaUrl() {
+  otaHttpUrl[0] = '\0';
+  if (!OTA_HTTP_BASE || !OTA_HTTP_BASE[0]) {
+    Serial.println("[OTA] pull disabilitato (OTA_HTTP_BASE vuoto)");
+    return;
+  }
+
+  const char* id = MxIdentity.provisioned() ? MxIdentity.deviceId() : "";
+  if (!id[0]) {
+    // Senza identita' il server non saprebbe chi ha chiamato. Non e' un
+    // motivo per rinunciare all'aggiornamento: il binario dipende da "fw",
+    // non da "id". Si avvisa e si manda un segnaposto riconoscibile.
+    Serial.println("[OTA] identita' non impostata: il server vedra' id=sconosciuto");
+    id = "sconosciuto";
+  }
+
+  int n = snprintf(otaHttpUrl, sizeof(otaHttpUrl), "%s?fw=%s&id=%s&token=%s",
+                   OTA_HTTP_BASE, OTA_FW_NAME, id, OTA_TOKEN ? OTA_TOKEN : "");
+  if (n < 0 || n >= (int)sizeof(otaHttpUrl)) {
+    otaHttpUrl[0] = '\0';
+    Serial.printf("[OTA] URL troppo lungo (%d caratteri, max %u): pull disabilitato\n",
+                  n, (unsigned)sizeof(otaHttpUrl) - 1);
+    return;
+  }
+  Serial.printf("[OTA] pull: fw=%s id=%s\n", OTA_FW_NAME, id);
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+  Serial.println();
+  Serial.println("Valve Latch Admin by MxSolutions.it - www.mxsolutions.it");
+  Serial.printf("Firmware %s su MxSolutionCore %s\n", FW_VERSION, MXCORE_VERSION);
+  Serial.println("----------------------------------------");
+
+  // PRIMA di ogni pinMode: senza sapere che scheda e', non si sa nemmeno
+  // quali GPIO toccare.
+  loadBoard();
+  Serial.printf("Scheda: %s | valvola1 A=%d B=%d | reset di fabbrica GPIO %d\n",
+                BOARDS[boardModel].label, valveA[0], valveB[0], factoryResetPin);
+
+  // PRIMA di tutto: valvole in uno stato noto. Sono 3,2 s bloccanti, ma
+  // devono avvenire prima della rete: MxCore.begin() puo' restare fermo
+  // minuti sul captive portal, e in quel tempo le valvole non possono
+  // essere in uno stato indefinito.
+  primeValvesOff();
+
+  // L'identita' serve PRIMA di comporre l'URL OTA. load() e' una semplice
+  // lettura da NVS, idempotente: MxCore.begin() la rifara' per conto suo.
+  MxIdentity.load();
+  buildOtaUrl();
+
+  cfg.fwVersion       = FW_VERSION;
+  cfg.wdtSeconds      = 15;
+  cfg.otaPassword     = OTA_PASSWORD;
+  cfg.otaHttpUrl      = otaHttpUrl;
+  cfg.factoryResetPin = factoryResetPin;   // dipende dal modello di scheda
+  cfg.requireIdentity = false;    // senza identita' le valvole devono comunque funzionare
+  cfg.staticIP        = STATIC_IP;
+  cfg.gateway         = GATEWAY;
+  cfg.subnet          = SUBNET;
+  cfg.dns1            = DNS1;
+  cfg.dns2            = DNS2;
+
+  MxCore.begin(cfg);   // identita' -> watchdog -> WiFi/portale -> NTP -> OTA
+
+  registerRoutes();
+  server.begin();
+  Serial.println("[HTTP] server avviato sulla porta 80");
+}
+
+void loop() {
+  MxCore.loop();            // watchdog + WiFi + OTA + persistenza ora
+  server.handleClient();
+  serviceValveQueue();      // motore non bloccante della coda valvole
+  handleSerial();
+  checkLowHeapRecovery();
+  captureBootEpochIfNeeded();
+}

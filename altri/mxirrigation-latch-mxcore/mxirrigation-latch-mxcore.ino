@@ -1,0 +1,598 @@
+/**
+ * ============================================================================
+ * Progetto:    MxIrrigation - Stazione 4 relè
+ * File:        mxirrigation-latch-mxcore.ino
+ * Autore:      Nicola Deboni - MxSolutions
+ * Versione:    1.0.1
+ * Ultima mod.: 2026-09-18
+ * Repository:  vault "03 - Elettronica/Progetti/mxirrigation" -> vedi
+ *              [[mxirrigation]] e [[esp32-latch-hbridge]] (nodo diverso)
+ * ----------------------------------------------------------------------------
+ * Descrizione:
+ *   Porting su MxSolutionCore 0.1.4 di "mxirrigation-latch.ino" (aprile 2024,
+ *   57 righe, in altri/mxirrigation-latch/). Comanda 4 uscite a relè via web,
+ *   con LED di stato. Identita', WiFi + captive portal, IP fisso configurabile,
+ *   NTP, watchdog e OTA vengono dalla libreria.
+ *
+ *   NON e' la centralina valvole latch a ponti ad H: quella e' un nodo a parte
+ *   (mxirrigation-esp32-latch-mxcore, 8 valvole, impulsi 400 ms). Vedi sotto.
+ *
+ * ============================================================================
+ *  DUE COSE DA VERIFICARE SULL'HARDWARE PRIMA DI FLASHARE
+ * ============================================================================
+ *
+ *  [1] GPIO1 E' IL TX DELLA SERIALE.
+ *      Lo sketch originale usa relayPins = {1, 2, 18, 5}. Sull'ESP32 classico
+ *      GPIO1 = U0TXD: con Serial.begin(115200) attivo, ogni riga di log
+ *      pilota quel pin. Nell'originale il problema era latente (poco log);
+ *      qui NON lo e' piu', perche' MxSolutionCore usa la seriale per il
+ *      banner di avvio, i comandi di provisioning dell'identita' e i log OTA.
+ *      Il relè 1 seguirebbe il traffico seriale, e la console sarebbe
+ *      disturbata dal relè.
+ *      -> Se il relè 1 e' davvero su GPIO1, RIMAPPARLO (sotto, RELAY_PINS)
+ *         su un GPIO libero (es. 27, 26, 33, 32, 19, 23).
+ *      -> In alternativa, per usarlo com'e': SERIAL_ENABLED 0. Ma cosi' si
+ *         perde il provisioning dell'identita' da seriale.
+ *      GPIO2 e' un pin di strapping (deve stare basso/flottante al boot):
+ *      usabile come uscita, ma non collegarci nulla che lo tiri alto.
+ *
+ *  [2] I RELE' RESTANO ECCITATI (comportamento dell'originale).
+ *      "on" mette il pin alto e ce lo lascia. Va bene per elettrovalvole
+ *      normali (24VAC, bobina sempre alimentata mentre irriga).
+ *      NON va bene per valvole LATCH/bistabili, che vogliono un IMPULSO:
+ *      tenerle eccitate BRUCIA LA BOBINA.
+ *      Il nome del file originale dice "latch", ma il codice tiene. O il
+ *      nome e' improprio, o l'originale ha un bug che danneggia l'hardware.
+ *      -> Qui e' stato mantenuto il comportamento dell'originale (tiene).
+ *         Se le valvole sono latch, NON flashare: serve la logica a impulsi
+ *         del nodo mxirrigation-esp32-latch-mxcore.
+ *
+ * ============================================================================
+ *
+ * Hardware:
+ *   Scheda:      ESP32 classico (dedotta dai GPIO usati; non dichiarata
+ *                nell'originale - da confermare)
+ *   Periferiche: 4 uscite a relè, 1 LED di stato
+ *
+ *   Pin:
+ *     GPIO   direzione   funzione                 note
+ *     1      OUT         Relè 1                   *** = U0TXD, vedi [1] ***
+ *     2      OUT         Relè 2                   pin di strapping
+ *     18     OUT         Relè 3
+ *     5      OUT         Relè 4                   pin di strapping
+ *     25     OUT         LED di stato             acceso = rete su,
+ *                                                 lampeggio = rete giu'
+ *     0      IN pull-up  Reset di fabbrica (BOOT) a massa >= 3 s all'avvio;
+ *                                                 cancella "mxnet", non "mxid"
+ *
+ *     Polarita' relè: RELAY_ACTIVE_HIGH 1 = "on" -> pin ALTO (come
+ *     l'originale). Molte schede relè sono attive basse: in quel caso
+ *     mettere 0, altrimenti all'avvio i relè scattano tutti.
+ *
+ * Arduino IDE / arduino-cli:
+ *   Board:            ESP32 Dev Module / esp32:esp32:esp32
+ *   Core version:     esp32 3.3.11
+ *   Partition Scheme: Minimal SPIFFS (min_spiffs) - obbligatorio, con la
+ *                     default si sta sopra l'85%
+ *   Flash:            QIO 80MHz, 4MB
+ *
+ *   Librerie (nome - versione esatta testata):
+ *     MxSolutionCore  - 0.1.4
+ *
+ * Note di versione:
+ *   2026-09-18 1.0.1 - /status dichiara "type":"relay4", cosi' il pannello di
+ *                      stato sa come interpretarlo e segnala se e' stato
+ *                      configurato col tipo sbagliato.
+ *   2026-09-10 1.0.0 - Prima versione su MxSolutionCore 0.1.4. Rispetto
+ *                      all'originale del 2024: niente credenziali WiFi nel
+ *                      sorgente (captive portal), IP fisso configurabile dal
+ *                      portale con 192.168.5.41 come default di fabbrica,
+ *                      identita' in NVS, watchdog, NTP, OTA (LAN + pull
+ *                      mxota) e check automatico all'avvio. Tolto il
+ *                      "while (WiFi.status() != WL_CONNECTED) delay(1000)"
+ *                      che bloccava il boot all'infinito senza rete; tolto il
+ *                      delay(1000) nel loop() per il lampeggio del LED.
+ *                      Rotte /N/on e /N/off invariate nella risposta (testo
+ *                      semplice) per non rompere eventuali script esistenti.
+ * ============================================================================
+ */
+
+#include <MxCore.h>
+#include <WebServer.h>
+#include <stdarg.h>
+
+const char* FW_VERSION = "1.0.1";
+
+// =========================================================================
+// CONFIGURAZIONE
+// =========================================================================
+
+// --- seriale -------------------------------------------------------------
+// 0 = niente seriale (necessario SOLO se il relè 1 resta su GPIO1, vedi [1]).
+// A 0 si perde il provisioning dell'identita' da console: va fatto prima,
+// con questo flag a 1 e il relè 1 scollegato.
+#define SERIAL_ENABLED 1
+
+// --- relè ----------------------------------------------------------------
+// ATTENZIONE al pin 1: vedi la nota [1] in testa al file.
+const int RELAY_PINS[]     = {1, 2, 18, 5};
+const int RELAY_COUNT      = sizeof(RELAY_PINS) / sizeof(RELAY_PINS[0]);
+#define   RELAY_ACTIVE_HIGH 1
+const int LED_PIN          = 25;
+
+// --- rete: IP fisso di DEFAULT -------------------------------------------
+// Nell'originale era commentato; qui e' il default di fabbrica, e chi monta
+// il device puo' cambiarlo (o passare a DHCP) dal captive portal, dove vince
+// sulla configurazione compilata.
+IPAddress STATIC_IP(192, 168, 5, 41);
+IPAddress GATEWAY  (192, 168, 5, 1);
+IPAddress SUBNET   (255, 255, 255, 0);
+IPAddress DNS1     (8, 8, 8, 8);
+IPAddress DNS2     (1, 1, 1, 1);
+
+// --- OTA -----------------------------------------------------------------
+// DA RIEMPIRE PRIMA DEL FLASH. Password vuota = ArduinoOTA disabilitato.
+// --- OTA: endpoint standard della flotta ---------------------------------
+// L'URL NON si scrive a mano intero. Il campo "fw" sceglie QUALE binario il
+// server consegna: sbagliarlo significa farsi installare il firmware di un
+// altro nodo (successo il 20/09/2026 sulle valvole, che chiedevano
+// "mxirrigation-pump"). Il campo "id" serve al server solo per sapere chi ha
+// chiamato, e viene preso dall'identita' del device A RUNTIME, cosi' lo stesso
+// sorgente puo' stare su piu' device senza che si confondano in manage.php.
+//
+// ATTENZIONE alla password ArduinoOTA: qui va una password NORMALE. NON
+// l'hash bcrypt di config.php del server mxota, che e' il segreto del pannello
+// di amministrazione e non deve finire nel binario di un device.
+const char* OTA_PASSWORD = "";
+const char* OTA_HTTP_BASE = "https://mxsolutions.it/mxota/api.php";
+const char* OTA_FW_NAME   = "mxirrigation-relay4";
+const char* OTA_TOKEN     = "wmpUpdate";
+
+// Composto in setup() da buildOtaUrl(): base + fw + id + token.
+// MxOta rifiuta un URL oltre i 224 caratteri, quindi si controlla qui.
+char otaHttpUrl[224] = "";
+
+// --- auth delle pagine web ----------------------------------------------
+#define AUTH_ENABLED 0
+const char* URL_PASSWORD = "change-me";
+
+// --- reset di fabbrica ---------------------------------------------------
+#define FACTORY_RESET_PIN 0     // BOOT; -1 = disabilitato
+
+// --- LED -----------------------------------------------------------------
+const unsigned long LED_BLINK_MS = 500;
+
+// =========================================================================
+// STATO
+// =========================================================================
+
+bool relayState[8] = {false, false, false, false, false, false, false, false};
+
+WebServer server(80);
+MxCoreConfig cfg;
+
+time_t bootEpoch = 0;
+bool   bootTimeCaptured = false;
+unsigned long lastLedMs = 0;
+bool  ledOn = false;
+
+// =========================================================================
+// RELE'
+// =========================================================================
+
+static inline int relayLevel(bool on) {
+#if RELAY_ACTIVE_HIGH
+  return on ? HIGH : LOW;
+#else
+  return on ? LOW : HIGH;
+#endif
+}
+
+void setRelay(int idx, bool on) {
+  if (idx < 0 || idx >= RELAY_COUNT) return;
+  digitalWrite(RELAY_PINS[idx], relayLevel(on));
+  relayState[idx] = on;
+#if SERIAL_ENABLED
+  Serial.printf("[RELAY] %d -> %s (GPIO%d)\n", idx + 1, on ? "ON" : "OFF", RELAY_PINS[idx]);
+#endif
+}
+
+// Tutti i relè a riposo. Chiamata PRIMA della rete: MxCore.begin() puo'
+// restare fermo minuti sul captive portal, e in quel tempo le uscite non
+// possono essere in uno stato indefinito.
+void primeRelaysOff() {
+  for (int i = 0; i < RELAY_COUNT; i++) {
+    pinMode(RELAY_PINS[i], OUTPUT);
+    digitalWrite(RELAY_PINS[i], relayLevel(false));
+    relayState[i] = false;
+  }
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+}
+
+// LED: acceso fisso se la rete c'e', lampeggio se manca. Non bloccante
+// (l'originale usava delay(1000) dentro il loop()).
+void serviceLed() {
+  if (MxNet.connected()) {
+    if (!ledOn) { digitalWrite(LED_PIN, HIGH); ledOn = true; }
+    return;
+  }
+  if (millis() - lastLedMs >= LED_BLINK_MS) {
+    lastLedMs = millis();
+    ledOn = !ledOn;
+    digitalWrite(LED_PIN, ledOn ? HIGH : LOW);
+  }
+}
+
+// =========================================================================
+// ORA
+// =========================================================================
+
+void formatDateTimeNow(char* out, size_t n) {
+  if (!MxTime.valid()) { snprintf(out, n, "Time not available"); return; }
+  MxTime.local(out, n, "%d/%m/%Y %H:%M:%S");
+}
+
+void formatEpochDateTime(time_t epoch, char* out, size_t n) {
+  if (epoch <= 0) { snprintf(out, n, "Not available"); return; }
+  struct tm t;
+  localtime_r(&epoch, &t);
+  strftime(out, n, "%d/%m/%Y %H:%M:%S", &t);
+}
+
+void captureBootEpochIfNeeded() {
+  if (bootTimeCaptured || !MxTime.valid()) return;
+  bootEpoch = MxTime.epoch() - (time_t)MxCore.uptimeS();
+  bootTimeCaptured = true;
+}
+
+// =========================================================================
+// AUTH + HELPER HTTP
+// =========================================================================
+
+String getAuthQuery() {
+#if AUTH_ENABLED
+  return String("?pass=") + URL_PASSWORD;
+#else
+  return "";
+#endif
+}
+
+bool isAuthorized() {
+#if AUTH_ENABLED
+  if (!server.hasArg("pass")) return false;
+  return server.arg("pass") == URL_PASSWORD;
+#else
+  return true;
+#endif
+}
+
+bool ensureAuthorized() {
+  if (isAuthorized()) return true;
+  server.send(401, "text/plain", "Unauthorized. Use ?pass=YOUR_PASSWORD in URL");
+  return false;
+}
+
+void sendChunk(const char* s) { server.sendContent(s); }
+
+void sendFmt(const char* fmt, ...) {
+  char buf[384];
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, args);
+  va_end(args);
+  server.sendContent(buf);
+}
+
+void startHtml(const char* title) {
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "text/html", "");
+  sendChunk("<!DOCTYPE html><html><head><meta charset='utf-8'>");
+  sendChunk("<meta name='viewport' content='width=device-width, initial-scale=1'>");
+  sendChunk("<meta http-equiv='Cache-Control' content='no-cache, no-store, must-revalidate'>");
+  sendChunk("<title>");
+  sendChunk(title);
+  sendChunk("</title></head><body style='font-family:Arial,sans-serif;font-size:14px;'>");
+}
+
+void endHtml() { sendChunk("</body></html>"); }
+
+void sendNav() {
+  String q = getAuthQuery();
+  sendFmt("<p><a href='/%s'>Home</a> | <a href='/info%s'>Info</a> | "
+          "<a href='/status%s'>JSON</a></p>", q.c_str(), q.c_str(), q.c_str());
+}
+
+// =========================================================================
+// PAGINE
+// =========================================================================
+
+void sendHomePage() {
+  char now[32];
+  formatDateTimeNow(now, sizeof(now));
+
+  startHtml("MxIrrigation - Relè");
+  sendFmt("<h3>MxIrrigation &mdash; %s</h3>",
+          MxIdentity.provisioned() ? MxIdentity.device() : "device non provisionato");
+  sendNav();
+  sendFmt("<p>%s</p>", now);
+
+  if (!MxIdentity.provisioned()) {
+    sendChunk("<p style='color:#b00'><b>Identita' non impostata</b>: comando seriale "
+              "<code>id set \"Nome Pista\" \"nome-device\"</code>.</p>");
+  }
+  if (MxOta.inProgress()) sendChunk("<p style='color:#b60'><b>Aggiornamento OTA in corso</b></p>");
+
+  sendChunk("<ul>");
+  String q = getAuthQuery();
+  for (int i = 0; i < RELAY_COUNT; i++) {
+    sendFmt("<li>Relè %d [%s] <a href='/%d/on%s'>ON</a> <a href='/%d/off%s'>OFF</a></li>",
+            i + 1, relayState[i] ? "ON" : "OFF",
+            i + 1, q.c_str(), i + 1, q.c_str());
+  }
+  sendChunk("</ul>");
+  endHtml();
+}
+
+void sendInfoPage() {
+  char now[32], boot[32];
+  formatDateTimeNow(now, sizeof(now));
+  formatEpochDateTime(bootEpoch, boot, sizeof(boot));
+
+  unsigned long s = MxCore.uptimeS();
+  unsigned long days  = s / 86400UL; s %= 86400UL;
+  unsigned long hours = s / 3600UL;  s %= 3600UL;
+  unsigned long mins  = s / 60UL;    s %= 60UL;
+
+  startHtml("MxIrrigation - Info");
+  sendChunk("<h3>System Info</h3>");
+  sendNav();
+  sendChunk("<pre>");
+  sendFmt("Firmware        : %s\n", FW_VERSION);
+  sendFmt("MxSolutionCore  : %s\n", MXCORE_VERSION);
+  sendFmt("Pista (site)    : %s\n", MxIdentity.provisioned() ? MxIdentity.site() : "(non impostata)");
+  sendFmt("Device          : %s\n", MxIdentity.provisioned() ? MxIdentity.device() : "(non impostato)");
+  sendFmt("Device ID       : %s\n", MxIdentity.provisioned() ? MxIdentity.deviceId() : "-");
+  sendFmt("IP              : %s (%s)\n", MxNet.ip().c_str(),
+          MxNet.usingStaticIP() ? "fisso" : "DHCP");
+  if (MxNet.usingStaticIP())
+    sendFmt("IP configurato  : %s / %s gw %s\n",
+            MxNet.staticIpStr(), MxNet.staticMaskStr(), MxNet.staticGwStr());
+  sendFmt("WiFi connected  : %s\n", MxNet.connected() ? "YES" : "NO");
+  sendFmt("Signal          : %ld dBm\n", (long)MxNet.rssi());
+  sendFmt("Date/time       : %s\n", now);
+  sendFmt("NTP sync        : %s\n", MxTime.valid() ? "YES" : "NO");
+  sendFmt("Boot time       : %s\n", boot);
+  sendFmt("ArduinoOTA      : %s\n", MxOta.armed() ? "armato" : "disabilitato");
+  sendFmt("OTA pull        : %s\n", otaHttpUrl[0] ? "configurato" : "non configurato");
+  if (otaHttpUrl[0]) sendFmt("OTA firmware    : %s\n", OTA_FW_NAME);
+  sendFmt("Watchdog        : %lu s\n", (unsigned long)MxWatchdog.timeoutS());
+  sendFmt("Relè            : %d\n", RELAY_COUNT);
+  sendFmt("Free heap       : %u\n", (unsigned)ESP.getFreeHeap());
+  sendFmt("Uptime          : %lu d, %lu h, %lu m, %lu s\n", days, hours, mins, s);
+  sendChunk("</pre>");
+
+  String q = getAuthQuery();
+  sendFmt("<p>%s</p>", MxOta.linkHtml());
+  sendFmt("<p><a href='/reboot%s' onclick=\"return confirm('Riavviare il device?');\">REBOOT DEVICE</a></p>",
+          q.c_str());
+  endHtml();
+}
+
+void sendStatusJson() {
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "application/json", "");
+
+  char now[32], boot[32];
+  formatDateTimeNow(now, sizeof(now));
+  formatEpochDateTime(bootEpoch, boot, sizeof(boot));
+
+  sendChunk("{");
+  // "type" identifica il nodo a chi lo legge (pannello di stato): le chiavi
+  // comuni sono uguali fra i nodi, il tipo dice come interpretare le altre.
+  sendChunk("\"type\":\"relay4\",");
+  sendFmt("\"firmware\":\"%s\",", FW_VERSION);
+  sendFmt("\"core\":\"%s\",", MXCORE_VERSION);
+  sendFmt("\"device_id\":\"%s\",", MxIdentity.provisioned() ? MxIdentity.deviceId() : "");
+  sendFmt("\"site\":\"%s\",", MxIdentity.site());
+  sendFmt("\"ip\":\"%s\",", MxNet.ip().c_str());
+  sendFmt("\"static_ip\":%s,", MxNet.usingStaticIP() ? "true" : "false");
+  sendFmt("\"wifi_connected\":%s,", MxNet.connected() ? "true" : "false");
+  sendFmt("\"wifi_rssi\":%ld,", (long)MxNet.rssi());
+  sendFmt("\"time_synced\":%s,", MxTime.valid() ? "true" : "false");
+  sendFmt("\"datetime\":\"%s\",", now);
+  sendFmt("\"boot_datetime\":\"%s\",", boot);
+  sendFmt("\"uptime_s\":%lu,", (unsigned long)MxCore.uptimeS());
+  sendFmt("\"heap\":%u,", (unsigned)ESP.getFreeHeap());
+  sendFmt("\"ntp_age_s\":%lu,", (unsigned long)MxTime.lastSyncAgeS());
+  sendFmt("\"ota\":%s,", MxOta.inProgress() ? "true" : "false");
+  sendChunk("\"relays\":[");
+  for (int i = 0; i < RELAY_COUNT; i++) {
+    sendFmt("{\"id\":%d,\"on\":%s}%s", i + 1, relayState[i] ? "true" : "false",
+            (i < RELAY_COUNT - 1) ? "," : "");
+  }
+  sendChunk("]}");
+}
+
+// =========================================================================
+// ROTTE
+// =========================================================================
+
+void registerRoutes() {
+  server.on("/",       HTTP_GET, []() { if (ensureAuthorized()) sendHomePage(); });
+  server.on("/info",   HTTP_GET, []() { if (ensureAuthorized()) sendInfoPage(); });
+  server.on("/status", HTTP_GET, []() { if (ensureAuthorized()) sendStatusJson(); });
+
+  // Rotta OTA registrata dalla libreria, con l'auth di questo progetto.
+  static char otaRedirect[48];
+  snprintf(otaRedirect, sizeof(otaRedirect), "/%s", getAuthQuery().c_str());
+  MxOta.attachWeb(server, "/ota", otaRedirect, ensureAuthorized);
+
+  server.on("/reboot", HTTP_GET, []() {
+    if (!ensureAuthorized()) return;
+    startHtml("Reboot");
+    sendChunk("<h3>Rebooting...</h3>");
+    endHtml();
+    delay(500);
+    ESP.restart();
+  });
+
+  // Risposta in testo semplice come nell'originale: eventuali script che
+  // chiamano questi endpoint continuano a funzionare.
+  for (int i = 0; i < RELAY_COUNT; i++) {
+    const int idx = i;
+    const int num = i + 1;
+    String onPath  = "/" + String(num) + "/on";
+    String offPath = "/" + String(num) + "/off";
+
+    server.on(onPath.c_str(), HTTP_GET, [idx, num]() {
+      if (!ensureAuthorized()) return;
+      setRelay(idx, true);
+      server.send(200, "text/plain", "Relay " + String(num) + " turned on");
+    });
+    server.on(offPath.c_str(), HTTP_GET, [idx, num]() {
+      if (!ensureAuthorized()) return;
+      setRelay(idx, false);
+      server.send(200, "text/plain", "Relay " + String(num) + " turned off");
+    });
+  }
+
+  server.onNotFound([]() {
+    if (!ensureAuthorized()) return;
+    server.send(404, "text/plain", "Not found");
+  });
+}
+
+// =========================================================================
+// CONSOLE SERIALE
+// =========================================================================
+
+#if SERIAL_ENABLED
+static void handleSerial() {
+  static char line[160];
+  static uint8_t n = 0;
+
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == '\r') continue;
+    if (c != '\n') { if (n < sizeof(line) - 1) line[n++] = c; continue; }
+    line[n] = '\0'; n = 0;
+
+    if (strncmp(line, "id set ", 7) == 0) {
+      char* args[5] = {0}; int a = 0; char* p = line + 7;
+      while (*p && a < 5) {
+        while (*p == ' ') p++;
+        if (*p == '"') { args[a++] = ++p; while (*p && *p != '"') p++; }
+        else           { args[a++] = p;   while (*p && *p != ' ') p++; }
+        if (*p) *p++ = '\0';
+      }
+      if (a >= 2) {
+        MxIdentity.provision(args[0], args[1], args[2], args[3], args[4]);
+        Serial.println("[ID] scritto. Riavvia per applicare.");
+      } else {
+        Serial.println("uso: id set \"Nome Pista\" \"nome-device\" [apiBase] [apiToken] [ntfyUrl]");
+      }
+    } else if (strcmp(line, "id show") == 0) {
+      MxIdentity.printTo(Serial);
+    } else if (strcmp(line, "wifi reset") == 0) {
+      MxNet.factoryReset("comando seriale");
+    } else if (strcmp(line, "status") == 0) {
+      char buf[420]; MxCore.statusJson(buf, sizeof(buf));
+      Serial.println(buf);
+    } else if (strcmp(line, "ota") == 0) {
+      MxOta.pending = true;
+      Serial.println("[OTA] check richiesto");
+    } else if (strncmp(line, "r ", 2) == 0) {
+      int num = atoi(line + 2);
+      const char* sp = strchr(line + 2, ' ');
+      if (num >= 1 && num <= RELAY_COUNT && sp) setRelay(num - 1, strcmp(sp + 1, "on") == 0);
+      else Serial.printf("uso: r <1-%d> on|off\n", RELAY_COUNT);
+    } else if (strcmp(line, "reboot") == 0) {
+      ESP.restart();
+    } else if (line[0]) {
+      Serial.printf("comandi: id set / id show / wifi reset / status / ota / r <1-%d> on|off / reboot\n",
+                    RELAY_COUNT);
+    }
+  }
+}
+#endif
+
+// =========================================================================
+// SETUP / LOOP
+// =========================================================================
+
+// Compone l'endpoint del pull OTA. Definita PRIMA di setup() apposta: l'IDE
+// non genera sempre il prototipo per una funzione usata prima di essere
+// definita, ed e' un inciampo gia' visto in questo progetto.
+void buildOtaUrl() {
+  otaHttpUrl[0] = 0;
+  if (!OTA_HTTP_BASE || !OTA_HTTP_BASE[0]) {
+    Serial.println("[OTA] pull disabilitato (OTA_HTTP_BASE vuoto)");
+    return;
+  }
+
+  const char* id = MxIdentity.provisioned() ? MxIdentity.deviceId() : "";
+  if (!id[0]) {
+    // Senza identita' il server non sa chi ha chiamato, ma il binario dipende
+    // da "fw", non da "id": si avvisa e si manda un segnaposto riconoscibile.
+    Serial.println("[OTA] identita' non impostata: il server vedra' id=sconosciuto");
+    id = "sconosciuto";
+  }
+
+  int n = snprintf(otaHttpUrl, sizeof(otaHttpUrl), "%s?fw=%s&id=%s&token=%s",
+                   OTA_HTTP_BASE, OTA_FW_NAME, id, OTA_TOKEN ? OTA_TOKEN : "");
+  if (n < 0 || n >= (int)sizeof(otaHttpUrl)) {
+    otaHttpUrl[0] = 0;
+    Serial.println("[OTA] URL troppo lungo (max 223 caratteri): pull disabilitato");
+    return;
+  }
+  Serial.printf("[OTA] pull: fw=%s id=%s\n", OTA_FW_NAME, id);
+}
+
+void setup() {
+#if SERIAL_ENABLED
+  Serial.begin(115200);
+  delay(300);
+  Serial.println();
+  Serial.println("MxIrrigation 4 rele' by MxSolutions.it");
+  Serial.printf("Firmware %s su MxSolutionCore %s\n", FW_VERSION, MXCORE_VERSION);
+#endif
+
+  // Uscite in stato noto PRIMA della rete (il portale puo' bloccare minuti).
+  primeRelaysOff();
+
+  // L'identita' serve PRIMA di comporre l'URL OTA. load() e' una lettura NVS
+  // idempotente: MxCore.begin() la rifara' per conto suo.
+  MxIdentity.load();
+  buildOtaUrl();
+
+  cfg.fwVersion       = FW_VERSION;
+  cfg.wdtSeconds      = 15;
+  cfg.otaPassword     = OTA_PASSWORD;
+  cfg.otaHttpUrl      = otaHttpUrl;
+  cfg.factoryResetPin = FACTORY_RESET_PIN;
+  cfg.requireIdentity = false;   // senza identita' i relè devono comunque funzionare
+  cfg.staticIP        = STATIC_IP;   // default di fabbrica: il portale lo scavalca
+  cfg.gateway         = GATEWAY;
+  cfg.subnet          = SUBNET;
+  cfg.dns1            = DNS1;
+  cfg.dns2            = DNS2;
+
+  MxCore.begin(cfg);
+
+  registerRoutes();
+  server.begin();
+#if SERIAL_ENABLED
+  Serial.println("[HTTP] server avviato sulla porta 80");
+#endif
+}
+
+void loop() {
+  MxCore.loop();
+  server.handleClient();
+  serviceLed();
+#if SERIAL_ENABLED
+  handleSerial();
+#endif
+  captureBootEpochIfNeeded();
+}

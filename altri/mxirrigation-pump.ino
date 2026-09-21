@@ -1,7 +1,7 @@
 /*
   MxIrrigation by MxSolutions.it
   Author: Nicola Deboni, Mx Solutions
-  Firmware version: 1.3.0
+  Firmware version: 1.2.2
 
   Description
   -----------
@@ -14,32 +14,12 @@
   - /logs page: shows last 10 events since boot (pump ON/OFF, alerts, restarts, etc.)
   - /pressure page: shows a simple cartesian graph (HTML5 canvas) of last hour pressure,
     sampled once per second (3600 samples). Graph uses converted pressure (bar).
-  - /info page: firmware / uptime / WiFi details (moved off the root page in 1.3.0)
-
-  Changelog
-  ---------
-  1.3.0
-    - System info (FW, Now, Uptime, WiFi block) moved from "/" to a dedicated
-      "/info" page. The root page keeps only pump state, pressure, links and
-      controls.
-    - State-change lock: while pumps are running OR a start sequence is in
-      progress OR a start is queued (pumpsBusy()), the root page shows only the
-      SPEGNI (stop) control and the start endpoints reject with HTTP 409.
-      /master/off is always available.
-    - Fixed serial banner ("Generator Admin" -> "MxIrrigation Pump Controller").
-  1.2.2 (previous) - baseline.
 
   Notes
   -----
   - Storing 3600 samples uses RAM. This implementation stores uint16_t pressure samples in
     centibar (bar*100) (~7.2 KB). This avoids floats in the history buffer.
   - Uptime month formatting is approximate and uses 30-day months.
-
-  Build note
-  ----------
-  The Arduino IDE compiles every .ino in a folder together. Keep this file in its
-  own folder, or remove/rename mxirrigation-pump.ino before compiling, otherwise
-  you get duplicate-symbol errors.
 */
 
 #include <WiFi.h>
@@ -49,7 +29,7 @@
 #include <WiFiClientSecure.h>
 #include <time.h>
 
-const char* FW_VERSION = "1.3.0";
+const char* FW_VERSION = "1.2.2";
 
 const char *ssid = "WMPSERVICE";
 const char *password = "motocross";
@@ -178,7 +158,6 @@ uint16_t rawToCentibar(int rawValue);
 void clearPressureAlertLogs();
 bool isWebAuthorized();
 bool ensureAuthorized();
-bool pumpsBusy();
 void resetSequencer();
 void stopAllPumps(const String& reason);
 void queueStartMode(StartMode mode, const String& actionLabel);
@@ -192,11 +171,9 @@ void checkLowPressureTripWhilePumpsOn();
 void monitorPingAndRebootWhenPumpsOff();
 void runPumpSequencer();
 void handleRoot();
-void handleInfo();
 void handleLogs();
 void handlePressure();
 void handleReboot();
-bool rejectIfPumpsBusy();
 
 static int median3(int a, int b, int c) {
   if (a > b) { int t = a; a = b; b = t; }
@@ -322,23 +299,6 @@ bool ensureAuthorized() {
   if (isWebAuthorized()) return true;
   server.send(403, "text/plain", "Forbidden");
   return false;
-}
-
-// True while pumps are running, a start sequence is in progress, or a start is
-// queued. Used to lock out further start commands (only OFF is allowed).
-bool pumpsBusy() {
-  return masterOn
-      || pumpSeqState != PSEQ_IDLE
-      || pendingStartMode != START_NONE
-      || activeStartMode != START_NONE;
-}
-
-// Helper for start endpoints: reply 409 and return true if a start must be refused.
-bool rejectIfPumpsBusy() {
-  if (!pumpsBusy()) return false;
-  server.send(409, "text/html",
-              "<font color=orange size=5>Pompe gia' in funzione o avvio in corso - spegnere prima</font>");
-  return true;
 }
 
 void resetSequencer() {
@@ -732,7 +692,14 @@ void runPumpSequencer() {
 
 void handleRoot() {
   bool authorized = isWebAuthorized();
-  bool busy = pumpsBusy();
+
+  String wifiState = (WiFi.status() == WL_CONNECTED) ? "CONNECTED" : "DISCONNECTED";
+  String wifiIP = WiFi.localIP().toString();
+  String wifiGW = WiFi.gatewayIP().toString();
+  String wifiMask = WiFi.subnetMask().toString();
+  String wifiSSID = WiFi.SSID();
+  int wifiRSSI = WiFi.RSSI();
+  String wifiMAC = WiFi.macAddress();
 
   String roothtml;
   roothtml += "<!DOCTYPE HTML>";
@@ -744,19 +711,35 @@ void handleRoot() {
   roothtml += "<div align=center>";
 
   roothtml += "<h2>MxIrrigation Pump Controller</h2>";
+  roothtml += "<div>FW: ";
+  roothtml += FW_VERSION;
+  roothtml += "</div>";
+  roothtml += "<div>Now: " + htmlEscape(nowString()) + "</div>";
+  roothtml += "<div>Uptime: " + htmlEscape(formatUptime(millis())) + "</div>";
+
+  roothtml += "<hr style='max-width:900px;'>";
+
+  roothtml += "<b>WiFi</b><br>";
+  roothtml += "Status: " + htmlEscape(wifiState) + "<br>";
+  roothtml += "SSID: " + htmlEscape(wifiSSID) + "<br>";
+  roothtml += "RSSI: " + String(wifiRSSI) + " dBm<br>";
+  roothtml += "IP: " + htmlEscape(wifiIP) + "<br>";
+  roothtml += "Gateway: " + htmlEscape(wifiGW) + "<br>";
+  roothtml += "Subnet: " + htmlEscape(wifiMask) + "<br>";
+  roothtml += "MAC: " + htmlEscape(wifiMAC) + "<br>";
+
+  roothtml += "<hr style='max-width:900px;'>";
 
   roothtml += "Stato pompe:";
-  if (masterOn)      roothtml += " <font color=red>ACCESE</font>";
-  else if (busy)     roothtml += " <font color=orange>AVVIO IN CORSO</font>";
-  else               roothtml += " <font color=green>SPENTE</font>";
+  if (masterOn) roothtml += " <font color=red>ACCESE</font>";
+  else          roothtml += " <font color=green>SPENTE</font>";
 
   roothtml += "<br><br>Pressione: raw ";
   roothtml += raw;
   roothtml += " | bar ";
   roothtml += String(valore, 2);
 
-  roothtml += "<br><br><a href=/info>System info</a>";
-  roothtml += "<br><a href=/logs>View logs</a>";
+  roothtml += "<br><br><a href=/logs>View logs</a>";
   roothtml += "<br><a href=/pressure>View pressure (last hour)</a>";
 
   if (authorized) {
@@ -765,19 +748,11 @@ void handleRoot() {
 #else
     String pwq = "";
 #endif
-
-    if (busy) {
-      // State-change lock: while pumps run / a start is in progress, only OFF.
-      roothtml += "<br><br><font color=gray>Pompe in funzione o avvio in corso: e' possibile solo lo spegnimento.</font>";
-      roothtml += "<br><br><a href=/master/off" + pwq + ">SPEGNI</a>";
-    } else {
-      roothtml += "<br><br><a href=/master/on" + pwq + ">Accendi entrambe</a>";
-      roothtml += "<br><br><a href=/master-solar/on" + pwq + ">Accendi master solar</a>";
-      roothtml += "<br><br><a href=/single" + pwq + ">Accendi singola</a>";
-      roothtml += "<br><br><a href=/staggered-auto" + pwq + ">Accendi doppia sequenza 5s / spegni seconda dopo 40s</a>";
-      roothtml += "<br><br><a href=/master/off" + pwq + ">SPEGNI</a>";
-    }
-
+    roothtml += "<br><br><a href=/master/on" + pwq + ">Accendi entrambe</a>";
+    roothtml += "<br><br><a href=/master-solar/on" + pwq + ">Accendi master solar</a>";
+    roothtml += "<br><br><a href=/single" + pwq + ">Accendi singola</a>";
+    roothtml += "<br><br><a href=/staggered-auto" + pwq + ">Accendi doppia sequenza 5s / spegni seconda dopo 40s</a>";
+    roothtml += "<br><br><a href=/master/off" + pwq + ">SPEGNI</a>";
     roothtml += "<br><br><button onclick=\"if(confirm('Reboot controller now?')){window.location='/reboot" + pwq + "';}\">Reboot controller</button>";
   } else {
 #if ENABLE_WEB_PASSWORD
@@ -790,41 +765,6 @@ void handleRoot() {
 
   roothtml += "</div></body></html>";
   server.send(200, "text/html", roothtml);
-}
-
-void handleInfo() {
-  String wifiState = (WiFi.status() == WL_CONNECTED) ? "CONNECTED" : "DISCONNECTED";
-
-  String html;
-  html += "<!DOCTYPE HTML><html><head>";
-  html += "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" /> ";
-  html += "<META HTTP-EQUIV=\"CACHE-CONTROL\" CONTENT=\"NO-CACHE\">";
-  html += "<meta http-equiv=\"Expires\" content=\"0\">";
-  html += "<title>MxIrrigation - System info</title></head><body>";
-  html += "<div align=center>";
-  html += "<h2>MxIrrigation - System info</h2>";
-  html += "<div style='margin-bottom:10px;'><a href='/'>Back</a></div>";
-
-  html += "<div>FW: ";
-  html += FW_VERSION;
-  html += "</div>";
-  html += "<div>Now: " + htmlEscape(nowString()) + "</div>";
-  html += "<div>Uptime: " + htmlEscape(formatUptime(millis())) + "</div>";
-
-  html += "<hr style='max-width:900px;'>";
-
-  html += "<b>WiFi</b><br>";
-  html += "Status: " + htmlEscape(wifiState) + "<br>";
-  html += "SSID: " + htmlEscape(WiFi.SSID()) + "<br>";
-  html += "RSSI: " + String(WiFi.RSSI()) + " dBm<br>";
-  html += "IP: " + htmlEscape(WiFi.localIP().toString()) + "<br>";
-  html += "Gateway: " + htmlEscape(WiFi.gatewayIP().toString()) + "<br>";
-  html += "Subnet: " + htmlEscape(WiFi.subnetMask().toString()) + "<br>";
-  html += "MAC: " + htmlEscape(WiFi.macAddress()) + "<br>";
-
-  html += "</div></body></html>";
-
-  server.send(200, "text/html", html);
 }
 
 void handleLogs() {
@@ -968,7 +908,7 @@ void setup() {
 
   Serial.begin(115200);
   while (!Serial) delay(1);
-  Serial.println("\n         MxIrrigation Pump Controller by MxSolutions.it");
+  Serial.println("\n            Generator Admin by MxSolutions.it");
   Serial.println("                  www.mxsolutions.it");
   Serial.println("                 All Rights Reserved");
   Serial.print("                 Versione firmware: ");
@@ -998,34 +938,29 @@ void setup() {
   addEventLog("BOOT: firmware " + String(FW_VERSION) + " started");
 
   server.on("/", handleRoot);
-  server.on("/info", handleInfo);
   server.on("/logs", handleLogs);
   server.on("/pressure", handlePressure);
 
   server.on("/master/on", HTTP_GET, []() {
     if (!ensureAuthorized()) return;
-    if (rejectIfPumpsBusy()) return;
     queueStartMode(START_MASTER_BOTH, "master/on");
     server.send(200, "text/html", "<font color=red size=5>master starting...</font>");
   });
 
   server.on("/master-solar/on", HTTP_GET, []() {
     if (!ensureAuthorized()) return;
-    if (rejectIfPumpsBusy()) return;
     queueStartMode(START_MASTER_SOLAR_BOTH, "master-solar/on");
     server.send(200, "text/html", "<font color=red size=5>master solar starting...</font>");
   });
 
   server.on("/single", HTTP_GET, []() {
     if (!ensureAuthorized()) return;
-    if (rejectIfPumpsBusy()) return;
     queueStartMode(START_SINGLE_ONLY, "single");
     server.send(200, "text/html", "<font color=red size=5>single starting...</font>");
   });
 
   server.on("/staggered-auto", HTTP_GET, []() {
     if (!ensureAuthorized()) return;
-    if (rejectIfPumpsBusy()) return;
     queueStartMode(START_STAGGERED_AUTO_OFF, "staggered-auto");
     server.send(200, "text/html", "<font color=red size=5>staggered auto sequence starting...</font>");
   });
