@@ -144,7 +144,7 @@ IPAddress DNS2     (1, 1, 1, 1);
 // l'hash bcrypt di config.php del server mxota, che e' il segreto del pannello
 // di amministrazione e non deve finire nel binario di un device.
 const char* OTA_PASSWORD = "";
-const char* OTA_HTTP_BASE = "https://mxsolutions.it/mxota/api.php";
+const char* OTA_HTTP_BASE = "https://www.mxsolutions.it/mxota/api.php";
 const char* OTA_FW_NAME   = "mxirrigation-relay4";
 const char* OTA_TOKEN     = "wmpUpdate";
 

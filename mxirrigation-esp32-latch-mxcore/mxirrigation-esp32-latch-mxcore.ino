@@ -166,8 +166,8 @@ const char* OTA_PASSWORD = "$2y$10$2U7O4S/degdXcsmHVfDPY.0cxqgMCBLYDIP3UNWaaU86.
 // chi ha chiamato, e viene preso dall'identita' del device a runtime, cosi'
 // lo stesso sorgente puo' stare su piu' centraline senza che si confondano
 // fra loro in manage.php.
-const char* OTA_HTTP_BASE = "https://mxsolutions.it/mxota/api.php";                       // "" = pull disabilitato
-                                                      // es. "https://mxsolutions.it/mxota/api.php"
+const char* OTA_HTTP_BASE = "https://www.mxsolutions.it/mxota/api.php";                       // "" = pull disabilitato
+                                                      // es. "https://www.mxsolutions.it/mxota/api.php"
 const char* OTA_FW_NAME   = "mxirrigation-latch";     // <-- NON "mxirrigation-pump"
 const char* OTA_TOKEN     = "wmp-2026a-123";                       // token condiviso col server
 
