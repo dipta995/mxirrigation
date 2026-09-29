@@ -3,7 +3,7 @@
  * Progetto:    MxIrrigation - Pannello di stato
  * File:        mxirrigation-display-cyd.ino
  * Autore:      Nicola Deboni - MxSolutions
- * Versione:    1.3.0
+ * Versione:    1.2.2
  * Ultima mod.: 2026-09-19
  * Repository:  vault "03 - Elettronica/Progetti/mxirrigation/firmware/
  *              mxirrigation-display-cyd" -> vedi [[status-display]] e
@@ -66,8 +66,7 @@
  *   PSRAM:            disabilitata (la 2432S028R non ne ha)
  *
  *   Librerie (nome - versione esatta testata):
- *     MxSolutionCore  - 0.1.8   (0.1.6 per MxAuth, 0.1.8 per l'OTA che
- *                                funziona davvero: vedi la nota in fondo)
+ *     MxSolutionCore  - 0.1.4
  *     LovyanGFX       - 1.2.29   (la 1.1.12 NON compila col core esp32 3.x:
  *                                il ramo legacy v0 si compila sempre e usa API
  *                                rimosse dall'IDF5)
@@ -79,26 +78,6 @@
  *   sketch TTGO T-Display e T4, e cambiarla li romperebbe.
  *
  * Note di versione:
- *   2026-09-27      - Ricompilato su MxSolutionCore 0.1.8 (nessuna modifica a
- *                      questo sketch). Cosa cambia sotto: l'OTA accetta la
- *                      risposta CHUNKED, che e' quella che manda il server
- *                      mxota reale - prima il pull si fermava su "risposta
- *                      senza Content-Length" e nessun nodo poteva
- *                      aggiornarsi; i timeout di connessione e di attesa
- *                      degli header stanno sotto il timeout del watchdog
- *                      (prima 6+15 = 21 s contro 15: un server lento a
- *                      RISPONDERE riavviava il device); un campo vuoto nel
- *                      captive portale non cancella piu' la password
- *                      salvata; niente piu' "TWDT already initialized" a
- *                      ogni avvio.
- *   2026-09-20 1.3.0 - OTA configurabile come negli altri nodi. L'impianto
- *                      c'era gia' tutto (arriva da MxCore: ArduinoOTA, il
- *                      link /ota, il comando seriale), ma password e URL del
- *                      pull erano due stringhe vuote scritte inline dentro
- *                      setup(): non si capiva nemmeno dove metterle. Ora sono
- *                      OTA_PASSWORD e OTA_HTTP_BASE in testa al file, con lo
- *                      stesso commento degli altri sketch, e /config dice a
- *                      che punto sta l'OTA invece di mostrare solo il link.
  *   2026-09-19 1.2.2 - FIX (DS9): un solo poll fallito non marca piu' il nodo
  *                      offline. Servono NODE_FAIL_LIMIT (2) fallimenti
  *                      CONSECUTIVI. Un timeout isolato, su WiFi, e' normale
@@ -136,40 +115,7 @@
 #define LGFX_USE_V1
 #include <LovyanGFX.hpp>
 
-const char* FW_VERSION = "1.3.0";
-
-// --- OTA: DA RIEMPIRE PRIMA DEL FLASH ------------------------------------
-// Il pannello sta a muro o su un palo: e' il nodo per cui salire col cavo
-// costa di piu', quindi e' anche quello che ha piu' senso aggiornare da
-// remoto. Finche' queste due restano vuote, pero', l'OTA e' disabilitato.
-//
-//  OTA_PASSWORD  "" -> ArduinoOTA non parte (push dall'IDE, stessa LAN)
-//  OTA_HTTP_BASE "" -> pull da mxota disabilitato. Solo la base: fw, id e
-//                      fw/id/token, massimo 224 caratteri (MxOta rifiuta un
-//                      URL piu' lungo e lo scrive su seriale):
-//   "https://SERVER/mxota/api.php?fw=mxirrigation-display&id=<device>&token=..."
-//
-// Con l'URL valorizzato MxCore controlla gli aggiornamenti anche da solo, 15 s
-// dopo ogni avvio (otaCheckOnBoot, default ON).
-// --- OTA: endpoint standard della flotta ---------------------------------
-// L'URL NON si scrive a mano intero. Il campo "fw" sceglie QUALE binario il
-// server consegna: sbagliarlo significa farsi installare il firmware di un
-// altro nodo (successo il 20/09/2026 sulle valvole, che chiedevano
-// "mxirrigation-pump"). Il campo "id" serve al server solo per sapere chi ha
-// chiamato, e viene preso dall'identita' del device A RUNTIME, cosi' lo stesso
-// sorgente puo' stare su piu' device senza che si confondano in manage.php.
-//
-// ATTENZIONE alla password ArduinoOTA: qui va una password NORMALE. NON
-// l'hash bcrypt di config.php del server mxota, che e' il segreto del pannello
-// di amministrazione e non deve finire nel binario di un device.
-const char* OTA_PASSWORD = "mxirr-6fquf15vxeow";
-const char* OTA_HTTP_BASE = "https://www.mxsolutions.it/mxota/api.php";
-const char* OTA_FW_NAME   = "mxirrigation-display";
-const char* OTA_TOKEN     = "wmpUpdate";
-
-// Composto in setup() da buildOtaUrl(): base + fw + id + token.
-// MxOta rifiuta un URL oltre i 224 caratteri, quindi si controlla qui.
-char otaHttpUrl[224] = "";
+const char* FW_VERSION = "1.2.2";
 
 // =========================================================================
 // DISPLAY: configurazione della ESP32-2432S028R
@@ -971,8 +917,7 @@ void handleConfigPage() {
   }
   h += "</table>";
   h += "<p class=hint>Il pannello legge <code>/status</code> di ogni nodo. "
-       "Richiede firmware <b>1013+</b> (oggi <b>1.19.0</b>) sulla centralina valvole "
-       "e <b>1.4.1+</b> "
+       "Richiede firmware <b>1013+</b> sulla centralina valvole e <b>1.4.1+</b> "
        "sul controller pompa: le versioni precedenti non espongono quel dato.</p>";
 
   h += "<h3>Aggiornamento</h3><table>";
@@ -988,13 +933,6 @@ void handleConfigPage() {
        "richieste sono distribuite nel tempo.</p>";
 
   h += "<br><button type=submit>Salva</button></form>";
-  h += "<p class=hint><b>OTA</b> &mdash; ArduinoOTA: ";
-  h += (MxOta.armed() ? "<b>armato</b> (push dall'IDE sulla LAN)"
-                      : "disabilitato <i>(OTA_PASSWORD vuota nel sorgente)</i>");
-  h += "<br>Pull mxota: ";
-  h += (otaHttpUrl[0] ? "<b>configurato</b> (fw <b>" + String(OTA_FW_NAME) + "</b>), controllo automatico a ogni avvio"
-                      : String("non configurato <i>(OTA_HTTP_BASE vuoto nel sorgente)</i>"));
-  h += "<br>Finche' sono entrambi spenti, per aggiornare questo pannello serve il cavo.</p>";
   h += String("<p class=hint><a href='/'>Stato</a> &middot; ") + MxOta.linkHtml() + "</p>";
   h += "</body></html>";
 
@@ -1113,12 +1051,7 @@ static void handleSerial() {
       lastPollMs = 0;
       Serial.println("[POLL] forzato");
     } else if (strcmp(line, "ota") == 0) {
-      if (otaHttpUrl[0]) {
-        MxOta.pending = true;
-        Serial.println("[OTA] check richiesto");
-      } else {
-        Serial.println("[OTA] nessuna sorgente: OTA_HTTP_BASE e' vuoto nel sorgente");
-      }
+      MxOta.pending = true;
     } else if (strcmp(line, "reboot") == 0) {
       ESP.restart();
     } else if (line[0]) {
@@ -1130,34 +1063,6 @@ static void handleSerial() {
 // =========================================================================
 // SETUP / LOOP
 // =========================================================================
-
-// Compone l'endpoint del pull OTA. Definita PRIMA di setup() apposta: l'IDE
-// non genera sempre il prototipo per una funzione usata prima di essere
-// definita, ed e' un inciampo gia' visto in questo progetto.
-void buildOtaUrl() {
-  otaHttpUrl[0] = 0;
-  if (!OTA_HTTP_BASE || !OTA_HTTP_BASE[0]) {
-    Serial.println("[OTA] pull disabilitato (OTA_HTTP_BASE vuoto)");
-    return;
-  }
-
-  const char* id = MxIdentity.provisioned() ? MxIdentity.deviceId() : "";
-  if (!id[0]) {
-    // Senza identita' il server non sa chi ha chiamato, ma il binario dipende
-    // da "fw", non da "id": si avvisa e si manda un segnaposto riconoscibile.
-    Serial.println("[OTA] identita' non impostata: il server vedra' id=sconosciuto");
-    id = "sconosciuto";
-  }
-
-  int n = snprintf(otaHttpUrl, sizeof(otaHttpUrl), "%s?fw=%s&id=%s&token=%s",
-                   OTA_HTTP_BASE, OTA_FW_NAME, id, OTA_TOKEN ? OTA_TOKEN : "");
-  if (n < 0 || n >= (int)sizeof(otaHttpUrl)) {
-    otaHttpUrl[0] = 0;
-    Serial.println("[OTA] URL troppo lungo (max 223 caratteri): pull disabilitato");
-    return;
-  }
-  Serial.printf("[OTA] pull: fw=%s id=%s\n", OTA_FW_NAME, id);
-}
 
 void setup() {
   Serial.begin(115200);
@@ -1180,15 +1085,10 @@ void setup() {
   tft.drawString("connessione...", SCR_W / 2, SCR_H / 2 + 12);
   tft.setTextDatum(lgfx::top_left);
 
-  // L'identita' serve PRIMA di comporre l'URL OTA. load() e' una lettura NVS
-  // idempotente: MxCore.begin() la rifara' per conto suo.
-  MxIdentity.load();
-  buildOtaUrl();
-
   cfg.fwVersion       = FW_VERSION;
   cfg.wdtSeconds      = 15;
-  cfg.otaPassword     = OTA_PASSWORD;
-  cfg.otaHttpUrl      = otaHttpUrl;
+  cfg.otaPassword     = "";
+  cfg.otaHttpUrl      = "";
   cfg.factoryResetPin = 0;
   cfg.requireIdentity = false;
   // Nessun IP fisso di fabbrica: il pannello non deve stare a un indirizzo

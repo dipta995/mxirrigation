@@ -3,8 +3,8 @@
  * Progetto:    MxIrrigation - Centralina valvole latch (H-bridge)
  * File:        mxirrigation-esp32-latch-mxcore.ino
  * Autore:      Nicola Deboni - MxSolutions
- * Versione:    1.19.0
- * Ultima mod.: 2026-09-26
+ * Versione:    1018
+ * Ultima mod.: 2026-09-19
  * Repository:  vault "03 - Elettronica/Progetti/mxirrigation" -> vedi
  *              [[esp32-latch-hbridge]] e [[mxirrigation]]
  * ----------------------------------------------------------------------------
@@ -71,66 +71,10 @@
  *   Flash:            QIO 80MHz, 4MB
  *
  *   Librerie (nome - versione esatta testata):
- *     MxSolutionCore  - 0.1.8   (0.1.6 per MxAuth, 0.1.8 per l'OTA che
- *                                funziona davvero: vedi la nota in fondo)
+ *     MxSolutionCore  - 0.1.4
  *     (nient'altro: ESPping non serve piu', il ping e' stato tolto)
  *
- *
- * NUMERAZIONE - cambiata il 2026-09-27, prima del primo flash di questa
- * versione. Questo firmware contava per interi (1011 ... 1019); tutti gli
- * altri nodi dell'impianto usano tre numeri (pompa 1.7.0, valvola a T 1.0.0,
- * pannello 1.3.0), e mxota confronta le versioni con version_compare quando
- * non sono entrambe numeriche. Da qui in avanti anche questo nodo usa lo
- * stesso schema:
- *
- *     1017 -> 1.17.0     1018 -> 1.18.0     1019 -> 1.19.0 (questa)
- *
- * Le voci di changelog qui sotto NON sono state riscritte: quelle versioni
- * sono esistite con quel numero, e sul campo gira ancora la 1016. Il "19"
- * e' stato tenuto proprio per non rompere la corrispondenza.
- *
- * ⚠️ Il cambio di schema va fatto COL CAVO, e questa e' l'unica finestra in
- * cui non costa niente. version_compare("1.19.0", "1016") confronta 1 con
- * 1016 e conclude che la nuova e' PIU' VECCHIA: un nodo che dichiara ancora
- * "1016" non riceverebbe MAI questo aggiornamento via mxota. Le due
- * centraline vanno flashate col cavo comunque (token da seriale e correzione
- * del watchdog nell'OTA), e su mxota non e' stato pubblicato ancora nessun
- * binario: dopo il flash tutti dichiarano lo stesso schema e i confronti
- * tornano coerenti.
- *
  * Note di versione:
- *   2026-09-27      - Ricompilato su MxSolutionCore 0.1.8 (nessuna modifica a
- *                      questo sketch). Cosa cambia sotto: l'OTA accetta la
- *                      risposta CHUNKED, che e' quella che manda il server
- *                      mxota reale - prima il pull si fermava su "risposta
- *                      senza Content-Length" e nessun nodo poteva
- *                      aggiornarsi; i timeout di connessione e di attesa
- *                      degli header stanno sotto il timeout del watchdog
- *                      (prima 6+15 = 21 s contro 15: un server lento a
- *                      RISPONDERE riavviava il device); un campo vuoto nel
- *                      captive portale non cancella piu' la password
- *                      salvata; niente piu' "TWDT already initialized" a
- *                      ogni avvio.
- *   2026-09-26 1.19.0 - AUTENTICAZIONE DELLE AZIONI (MxAuth, MxSolutionCore
- *                     0.1.6). Fino alla 1018 aprire una valvola era una GET
- *                     senza password: bastava l'indirizzo in una barra, un
- *                     segnalibro, un prefetch del browser o una <img src> in
- *                     una pagina qualunque. Ora valvole, /reboot, /ota e
- *                     /config/save vogliono POST + token nell'header
- *                     "X-Mx-Token", e la pagina di configurazione puo' avere
- *                     una password sua ("X-Mx-Cfg"). Tre interruttori in NVS
- *                     ("mxauth"), modificabili da /config o da seriale col
- *                     comando "auth": metodo (solo POST / anche GET), token
- *                     richiesto si-no, password della pagina.
- *                     ATTENZIONE: DOPO IL FLASH I COMANDI SONO BLOCCATI
- *                     finche' non si imposta il token da seriale:
- *                        auth token <valore>
- *                     /status resta SENZA autenticazione: lo leggono il
- *                     pannello di stato e il collettore dei dati, non cambia
- *                     niente sul device e non espone segreti.
- *                     I pulsanti delle pagine non sono piu' link ma fetch()
- *                     in POST; il token sta nel localStorage del browser e
- *                     viaggia in un header, mai nell'URL.
  *   2026-09-20 1018 - Due correzioni misurate sul campo:
  *                     1) /status esce in UN SOLO server.send() con il suo
  *                        Content-Length, non piu' in ~30 sendContent() in
@@ -189,7 +133,7 @@
 #include <stdarg.h>
 #include <Preferences.h>
 
-const char* FW_VERSION = "1.19.0";
+const char* FW_VERSION = "1018";
 
 // =========================================================================
 // CONFIGURAZIONE
@@ -214,7 +158,7 @@ IPAddress DNS2     (1, 1, 1, 1);
 // installa. NON l'hash bcrypt di config.php del server mxota: quello e'
 // il segreto del pannello di amministrazione e non deve finire dentro il
 // binario di un device, da cui chiunque puo' rileggerlo.
-const char* OTA_PASSWORD = "mxirr-6fquf15vxeow";      // "" = ArduinoOTA disabilitato
+const char* OTA_PASSWORD = "$2y$10$2U7O4S/degdXcsmHVfDPY.0cxqgMCBLYDIP3UNWaaU86.sO2Lk.iO";      // "" = ArduinoOTA disabilitato
 
 // L'URL del pull NON si scrive a mano intero: il campo "fw" sceglie QUALE
 // binario il server consegna, e sbagliarlo significa farsi installare il
@@ -438,14 +382,8 @@ void addCommandLog(uint8_t valveNumber, const char* action) {
 }
 
 // =========================================================================
-// AUTH LEGACY DELLE PAGINE  (?pass=..., invariata dalla 1012)
+// AUTH  (invariata dalla 1012)
 // =========================================================================
-//
-// Questa protegge solo la LETTURA delle pagine, ed e' disattivata
-// (AUTH_ENABLED 0). Le AZIONI - valvole, reboot, ota, salvataggio della
-// configurazione - non passano piu' da qui: le controlla MxAuth (POST +
-// token in header). Le due cose sono separate di proposito: una pagina che
-// si legge e un comando che apre l'acqua non hanno lo stesso peso.
 
 String getAuthQuery() {
 #if AUTH_ENABLED
@@ -663,28 +601,6 @@ void startHtml(const char* title) {
   sendChunk("<meta http-equiv='Cache-Control' content='no-cache, no-store, must-revalidate'>");
   sendChunk("<meta http-equiv='Pragma' content='no-cache'>");
   sendChunk("<meta http-equiv='Expires' content='0'>");
-
-  // Il token sta nel localStorage del BROWSER e viaggia in un header, mai
-  // nell'URL: cosi' non finisce nella cronologia, nei log ne' nel Referer.
-  // Nessuna sessione lato ESP32, nessun cookie, nessuno stato da tenere su
-  // un dispositivo che ha poca memoria.
-  sendChunk("<script>"
-            "function mxTok(f){var t=localStorage.getItem('mxtoken')||'';"
-            "if(!t||f){t=prompt('Token del nodo:',t)||'';"
-            "if(t)localStorage.setItem('mxtoken',t);}return t;}"
-            "function mxCfg(f){var t=localStorage.getItem('mxcfgpw')||'';"
-            "if(!t||f){t=prompt('Password della pagina di configurazione:',t)||'';"
-            "if(t)localStorage.setItem('mxcfgpw',t);}return t;}"
-            "async function mxPost(p,body){"
-            "var r=await fetch(p,{method:'POST',headers:{'X-Mx-Token':mxTok(false),"
-            "'X-Mx-Cfg':localStorage.getItem('mxcfgpw')||'',"
-            "'Content-Type':'application/x-www-form-urlencoded'},body:body||''});"
-            "if(r.status===401){var j=await r.json().catch(function(){return {};});"
-            "alert('Non autorizzato'+(j.hint?': '+j.hint:'.'));mxTok(true);return null;}"
-            "if(!r.ok){alert('Errore '+r.status);return null;}return r;}"
-            "async function mxCmd(p){var r=await mxPost(p);"
-            "if(r)setTimeout(function(){location.reload();},600);}"
-            "</script>");
   sendChunk("<title>");
   sendChunk(title);
   sendChunk("</title>");
@@ -696,26 +612,16 @@ void endHtml() { sendChunk("</body></html>"); }
 void sendNavCompact() {
   String q = getAuthQuery();
   sendFmt("<p><a href='/%s'>Home</a> | <a href='/info%s'>Info</a> | "
-          "<a href='/config%s'>Config</a> | <a href='/logs%s'>Logs</a> | "
-          "<a href='/status%s'>JSON</a></p>",
-          q.c_str(), q.c_str(), q.c_str(), q.c_str(), q.c_str());
+          "<a href='/logs%s'>Logs</a> | <a href='/status%s'>JSON</a></p>",
+          q.c_str(), q.c_str(), q.c_str(), q.c_str());
 }
 
-// Risposta di un comando accettato. Non piu' un redirect 303 verso la home:
-// i pulsanti ora fanno fetch() e ricaricano da soli, e un client come lo
-// scheduler vuole una risposta che si possa LEGGERE, non una pagina.
-//
-// Dice "accodato" e non "fatto": il comando e' entrato nella coda FIFO,
-// l'impulso di 400 ms parte nei millisecondi successivi. Lo stato vero si
-// legge da /status.
-void sendActionOk(int idx, bool on) {
-  String b = "{\"ok\":true,\"action\":\"";
-  b += on ? "on" : "off";
-  b += "\",\"valve\":" + String(idx + 1);
-  b += ",\"queued\":" + String(valveQueue.count);
-  b += ",\"busy\":"   + String(currentPulse.active ? "true" : "false");
-  b += "}";
-  server.send(200, "application/json", b);
+// Risposta leggera per i comandi valvola: redirect 303 verso la home.
+void sendRedirectHome() {
+  String loc = String("/") + getAuthQuery();
+  server.sendHeader("Location", loc);
+  server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+  server.send(303, "text/plain", "See Other");
 }
 
 void sendHomePage() {
@@ -740,29 +646,14 @@ void sendHomePage() {
   int pending = valvePendingCount();
   if (pending > 0) sendFmt("<p><i>Comandi in elaborazione: %d</i></p>", pending);
 
-  // Lo stato dell'autenticazione va detto in chiaro sulla home: un nodo
-  // appena flashato che rifiuta tutto, e un nodo aperto a chiunque, sono
-  // due situazioni che chi guarda la pagina deve vedere subito.
-  if (MxAuth.misconfigured()) {
-    sendChunk("<p style='color:#b00'><b>Comandi bloccati.</b> Il token e' richiesto "
-              "ma non e' impostato. Da seriale: <code>auth token &lt;valore&gt;</code>, "
-              "oppure togli il token da <a href='/config'>/config</a>.</p>");
-  } else if (!MxAuth.requireToken()) {
-    sendChunk("<p style='color:#b60'><b>Nessun token richiesto:</b> chiunque sulla rete "
-              "locale puo' aprire e chiudere le valvole.</p>");
-  }
-
   sendChunk("<ul>");
+  String q = getAuthQuery();
   for (int i = 0; i < VALVE_COUNT; i++) {
-    sendFmt("<li>V%d [%s] "
-            "<button onclick=\"mxCmd('/%d/on')\">ON</button> "
-            "<button onclick=\"mxCmd('/%d/off')\">OFF</button></li>",
-            i + 1, valveStatus[i] ? "ON" : "OFF", i + 1, i + 1);
+    sendFmt("<li>V%d [%s] <a href='/%d/on%s'>ON</a> <a href='/%d/off%s'>OFF</a></li>",
+            i + 1, valveStatus[i] ? "ON" : "OFF",
+            i + 1, q.c_str(), i + 1, q.c_str());
   }
   sendChunk("</ul>");
-  sendChunk("<p style='color:#555;font-size:12px'>I comandi partono in POST col token "
-            "del browser. La pagina si ricarica da sola dopo mezzo secondo, il tempo "
-            "dell'impulso.</p>");
   endHtml();
 }
 
@@ -804,14 +695,6 @@ void sendInfoPage() {
   sendFmt("OTA pull        : %s\n", otaHttpUrl[0] ? "configurato" : "non configurato");
   if (otaHttpUrl[0]) sendFmt("OTA firmware    : %s\n", OTA_FW_NAME);
   sendFmt("Watchdog        : %lu s\n", (unsigned long)MxWatchdog.timeoutS());
-  sendFmt("Azioni          : %s\n",
-          MxAuth.allowGet() ? "POST e GET (compatibilita')" : "solo POST");
-  sendFmt("Token           : %s\n",
-          !MxAuth.requireToken() ? "NON richiesto - chiunque sulla LAN comanda"
-                                 : (MxAuth.tokenSet()
-                                      ? "richiesto, impostato"
-                                      : "RICHIESTO MA NON IMPOSTATO - azioni bloccate"));
-  sendFmt("Pagina config   : %s\n", MxAuth.configPwSet() ? "protetta da password" : "aperta");
   sendFmt("Valve pulse     : %d ms\n", VALVE_PULSE_MS);
   sendFmt("Valve queue     : %d in coda%s\n",
           valveQueue.count, currentPulse.active ? " (+1 in corso)" : "");
@@ -821,15 +704,10 @@ void sendInfoPage() {
           months, days, hours, mins, s);
   sendChunk("</pre>");
 
-  // Non si usa piu' MxOta.linkHtml(): quello e' un <a href> in GET, e la
-  // rotta GET della libreria adesso risponde 405 in modalita' solo-POST.
-  // L'aggiornamento e il riavvio sono azioni, e passano da mxCmd().
-  sendChunk("<p><button onclick=\"if(confirm('Cercare un aggiornamento adesso? "
-            "Se ce n\\'e uno, il device si riavvia.'))mxCmd('/ota')\">"
-            "Cerca aggiornamenti</button></p>");
-  sendChunk("<p><button onclick=\"if(confirm('Riavviare la centralina? Le valvole "
-            "restano come sono: sono bistabili.'))mxCmd('/reboot')\">"
-            "REBOOT DEVICE</button></p>");
+  String q = getAuthQuery();
+  // Link pronto fornito da MxOta (registrato con attachWeb in setup()).
+  sendFmt("<p>%s</p>", MxOta.linkHtml());
+  sendFmt("<p><a href='/reboot%s' onclick=\"return confirm('Are you sure you want to reboot the controller?');\">REBOOT DEVICE</a></p>", q.c_str());
   endHtml();
 }
 
@@ -872,7 +750,7 @@ void sendLogsPage() {
 // intera o non parte: o il client la riceve tutta, o vede un errore onesto.
 void sendStatusJson() {
   String b;
-  b.reserve(1024);         // il corpo pieno sta sotto gli 850 byte
+  b.reserve(896);          // il corpo pieno sta sotto i 700 byte
 
   char nowBuf[32], bootBuf[32];
   formatDateTimeNow(nowBuf, sizeof(nowBuf));
@@ -904,11 +782,6 @@ void sendStatusJson() {
   b += "\"ntp_age_s\":" + String((unsigned long)MxTime.lastSyncAgeS()) + ",";
   b += "\"ota\":" + String(MxOta.inProgress() ? "true" : "false") + ",";
 
-  // Come e' configurata l'autenticazione - non i segreti. Serve al pannello
-  // e al futuro scheduler per accorgersi, e segnalare, che un nodo e'
-  // rimasto aperto a tutti o e' bloccato perche' manca il token.
-  b += MxAuth.statusJson() + ",";
-
   b += "\"valves\":[";
   for (int i = 0; i < VALVE_COUNT; i++) {
     b += "{\"id\":" + String(i + 1) + ",\"on\":" + String(valveStatus[i] ? "true" : "false") + "}";
@@ -935,26 +808,18 @@ void sendStatusJson() {
 // ROUTE
 // =========================================================================
 
-// L'autenticazione e' fatta dalla rotta (MxAuth.checkAction): qui si arriva
-// solo a comando autorizzato. Il controllo NON si ripete dentro l'handler,
-// perche' due posti dove scrivere la stessa regola sono due posti dove
-// dimenticarsene uno - in questo progetto e' gia' successo.
 void handleValveOn(int idx) {
-  if (idx < 0 || idx >= VALVE_COUNT) {
-    server.send(404, "application/json", "{\"ok\":false,\"error\":\"invalid_valve\"}");
-    return;
-  }
+  if (!ensureAuthorized()) return;
+  if (idx < 0 || idx >= VALVE_COUNT) { server.send(404, "text/plain", "Invalid valve"); return; }
   enqueueValveCommand(idx, true);
-  sendActionOk(idx, true);
+  sendRedirectHome();
 }
 
 void handleValveOff(int idx) {
-  if (idx < 0 || idx >= VALVE_COUNT) {
-    server.send(404, "application/json", "{\"ok\":false,\"error\":\"invalid_valve\"}");
-    return;
-  }
+  if (!ensureAuthorized()) return;
+  if (idx < 0 || idx >= VALVE_COUNT) { server.send(404, "text/plain", "Invalid valve"); return; }
   enqueueValveCommand(idx, false);
-  sendActionOk(idx, false);
+  sendRedirectHome();
 }
 
 // =========================================================================
@@ -962,8 +827,9 @@ void handleValveOff(int idx) {
 // =========================================================================
 
 void sendConfigPage() {
-  startHtml("MxIrrigation - Configurazione");
-  sendChunk("<h3>Configurazione</h3>");
+  String q = getAuthQuery();
+  startHtml("MxIrrigation - Scheda");
+  sendChunk("<h3>Modello di scheda</h3>");
   sendNavCompact();
 
   if (server.hasArg("saved")) {
@@ -973,80 +839,14 @@ void sendConfigPage() {
 
   sendFmt("<p>Scheda attuale: <b>%s</b></p>", BOARDS[boardModel].label);
 
-  // Il form non NAVIGA piu': si salva con fetch() in POST, perche' il token e
-  // la password della pagina viaggiano in header e un submit normale non puo'
-  // metterli.
-  sendChunk("<form id='cfgform' onsubmit='return mxSaveCfg(event)'>");
+  sendFmt("<form method='POST' action='/config/save%s'>", q.c_str());
   sendChunk("<p>");
   for (int b = 0; b < BOARD_COUNT; b++) {
     sendFmt("<label><input type=radio name=board value='%d'%s> %s</label><br>",
             b, (b == boardModel) ? " checked" : "", BOARDS[b].label);
   }
   sendChunk("</p>");
-
-  // --- sicurezza --------------------------------------------------------
-  sendChunk("<h4>Sicurezza</h4>");
-  sendChunk("<table border=0 cellpadding=4 style='margin:0 auto;text-align:left'>");
-  sendFmt("<tr><td>Metodo delle azioni</td><td>"
-          "<label><input type=radio name='authget' value='0'%s> solo POST</label><br>"
-          "<label><input type=radio name='authget' value='1'%s> POST e GET</label>"
-          "</td></tr>",
-          MxAuth.allowGet() ? "" : " checked",
-          MxAuth.allowGet() ? " checked" : "");
-  sendFmt("<tr><td>Token richiesto</td>"
-          "<td><input type=checkbox name='authreq' value='1'%s></td></tr>",
-          MxAuth.requireToken() ? " checked" : "");
-  sendFmt("<tr><td>Token</td>"
-          "<td><input type=text name='authtok' placeholder='%s' size=30></td></tr>",
-          MxAuth.tokenSet() ? "impostato - scrivi per cambiarlo" : "NON impostato");
-  sendFmt("<tr><td>Password di questa pagina</td>"
-          "<td><input type=text name='authcfgpw' placeholder='%s' size=30></td></tr>",
-          MxAuth.configPwSet() ? "impostata - scrivi per cambiarla" : "non impostata");
-  sendChunk("</table>");
-
-  sendChunk("<p style='max-width:34em;margin:1em auto;text-align:left;color:#555'>"
-            "<b>Solo POST</b> e' il modo sicuro: un comando valvola non si puo' piu' "
-            "mettere in un segnalibro, ne' innescare con un prefetch del browser o con "
-            "una &lt;img src&gt; in una pagina qualunque.<br>"
-            "<b>POST e GET</b> serve solo durante la transizione, per non rompere script "
-            "e segnalibri che esistono gia'. In quella modalita' il token viaggia in "
-            "query string, quindi finisce nei log e nella cronologia: e' un ripiego, non "
-            "un pari grado.<br>"
-            "<b>Togliendo il token</b> si torna al comportamento di prima: chiunque "
-            "sulla rete locale apre e chiude le valvole.<br>"
-            "I campi del token e della password si lasciano vuoti per non cambiarli. "
-            "Per cancellarli, o se la password di questa pagina si perde, si usa la "
-            "seriale: <code>auth token off</code>, <code>auth cfgpw off</code>.</p>");
-
-  sendChunk("<p><button type=submit>Salva</button></p></form>");
-  sendChunk("<p id='cfgnote' style='color:#555'></p>");
-
-  // Il salvataggio va in POST con gli header; i VALORI correnti si leggono da
-  // /config/data, perche' un browser che NAVIGA non puo' mettere header: la
-  // pagina si apre sempre, i valori arrivano solo a chi ha la password.
-  sendChunk("<script>"
-            "async function mxSaveCfg(e){e.preventDefault();"
-            "var f=document.getElementById('cfgform');"
-            "var r=await mxPost('/config/save',"
-            "new URLSearchParams(new FormData(f)).toString());"
-            "if(r){var j=await r.json().catch(function(){return {};});"
-            "if(j.reboot){alert('Salvato. La centralina si riavvia con la nuova mappa pin.');}"
-            "else{alert('Salvato.');location.reload();}}return false;}"
-            "(async function(){"
-            "var h={'X-Mx-Cfg':localStorage.getItem('mxcfgpw')||''};"
-            "var r=await fetch('/config/data',{headers:h});"
-            "if(r.status===401){mxCfg(true);"
-            "r=await fetch('/config/data',{headers:{'X-Mx-Cfg':"
-            "localStorage.getItem('mxcfgpw')||''}});}"
-            "if(!r.ok){document.getElementById('cfgnote').textContent="
-            "'Valori non disponibili: password della pagina mancante o errata.';return;}"
-            "var d=await r.json();"
-            "document.getElementById('cfgnote').textContent="
-            "'Token: '+(d.auth.token_set?'impostato':'NON impostato')+"
-            "' - azioni: '+(d.auth.allow_get?'POST e GET':'solo POST')+"
-            "(d.auth.misconfigured?' - ATTENZIONE: comandi bloccati':'');"
-            "})();"
-            "</script>");
+  sendChunk("<p><button type=submit>Salva e riavvia</button></p></form>");
 
   // Tabella pin della scheda selezionata: chi apre questa pagina deve poter
   // confrontare col cablaggio reale senza andare a cercare il sorgente.
@@ -1072,35 +872,15 @@ void sendConfigPage() {
   endHtml();
 }
 
-// Qui si arriva solo dopo checkAction + checkConfig (vedi registerRoutes):
-// senza il secondo, chiunque sulla LAN potrebbe rimettere "GET senza token"
-// dalla pagina stessa - il lucchetto sulla porta con la chiave appesa fuori.
 void handleConfigSave() {
+  if (!ensureAuthorized()) return;
   if (!server.hasArg("board")) {
-    server.send(400, "application/json", "{\"ok\":false,\"error\":\"manca il modello\"}");
+    server.send(400, "text/plain", "manca il modello");
     return;
   }
   int b = server.arg("board").toInt();
   if (b < 0 || b >= BOARD_COUNT) {
-    server.send(400, "application/json", "{\"ok\":false,\"error\":\"modello sconosciuto\"}");
-    return;
-  }
-
-  // Sicurezza. I campi vuoti NON cancellano: si lasciano vuoti per non
-  // cambiare il segreto, e per cancellarlo c'e' la seriale.
-  if (server.hasArg("authget")) MxAuth.setAllowGet(server.arg("authget") == "1");
-  MxAuth.setRequireToken(server.hasArg("authreq"));
-  if (server.hasArg("authtok") && server.arg("authtok").length())
-    MxAuth.setToken(server.arg("authtok").c_str());
-  if (server.hasArg("authcfgpw") && server.arg("authcfgpw").length())
-    MxAuth.setConfigPassword(server.arg("authcfgpw").c_str());
-
-  // La scheda non e' cambiata: niente da riavviare. Riavviare per un token
-  // vorrebbe dire far cadere la rete e i comandi in coda per nulla.
-  if (b == boardModel) {
-    addCommandLog(0, "CFG");
-    Serial.println("[CFG] sicurezza aggiornata da web (scheda invariata)");
-    server.send(200, "application/json", "{\"ok\":true,\"reboot\":false}");
+    server.send(400, "text/plain", "modello sconosciuto");
     return;
   }
 
@@ -1110,90 +890,44 @@ void handleConfigSave() {
 
   // I pin sono gia' configurati come uscite con la mappa vecchia: cambiarli a
   // caldo lascerebbe dei GPIO pilotati che non dovrebbero esserlo. Si riavvia.
-  server.send(200, "application/json", "{\"ok\":true,\"reboot\":true}");
+  startHtml("MxIrrigation - Scheda");
+  sendFmt("<h3>Scheda impostata su %s</h3><p>Riavvio in corso...</p>", BOARDS[b].label);
+  endHtml();
   delay(400);
   ESP.restart();
 }
 
-// Valori correnti della configurazione, per la pagina. Separati dal guscio
-// HTML perche' un browser che NAVIGA non puo' mettere header: il guscio si
-// apre sempre, i valori arrivano solo a chi ha la password.
-void handleConfigData() {
-  String h = "{";
-  h += "\"board\":\""       + String(BOARDS[boardModel].id) + "\",";
-  h += "\"board_label\":\"" + String(BOARDS[boardModel].label) + "\",";
-  h += "\"factory_reset_pin\":" + String(factoryResetPin) + ",";
-  h += "\"valve_pulse_ms\":"    + String(VALVE_PULSE_MS) + ",";
-  h += MxAuth.statusJson();
-  h += "}";
-  server.send(200, "application/json", h);
-}
-
-// L'OTA cambia il firmware: e' un'azione, e passa dallo stesso controllo dei
-// comandi valvola. La libreria vuole un puntatore a funzione senza argomenti.
-static bool otaWebAuth() { return MxAuth.checkAction(server); }
-
 void registerRoutes() {
-  // ⚠️ Senza questa il WebServer dell'ESP32 SCARTA gli header che non gli sono
-  // stati dichiarati: server.header("X-Mx-Token") tornerebbe sempre vuoto e
-  // ogni comando sarebbe rifiutato con 401 senza che si capisca perche'.
-  MxAuth.collectHeaders(server);
+  server.on("/",       HTTP_GET, []() { if (ensureAuthorized()) sendHomePage(); });
+  server.on("/info",   HTTP_GET, []() { if (ensureAuthorized()) sendInfoPage(); });
+  server.on("/config", HTTP_GET, []() { if (ensureAuthorized()) sendConfigPage(); });
+  server.on("/config/save", HTTP_POST, handleConfigSave);
+  server.on("/logs",   HTTP_GET, []() { if (ensureAuthorized()) sendLogsPage(); });
+  server.on("/status", HTTP_GET, []() { if (ensureAuthorized()) sendStatusJson(); });
 
-  // Pagine in sola lettura.
-  server.on("/",     HTTP_GET, []() { if (ensureAuthorized()) sendHomePage(); });
-  server.on("/info", HTTP_GET, []() { if (ensureAuthorized()) sendInfoPage(); });
-  server.on("/logs", HTTP_GET, []() { if (ensureAuthorized()) sendLogsPage(); });
+  // Rotta "/ota": la registra MxOta, passandogli l'auth di questo progetto.
+  // Alza solo il flag e risponde con un 303 verso la home; il download parte
+  // dal loop() successivo, l'handler HTTP non resta appeso.
+  // Il redirect si porta dietro ?pass= se AUTH_ENABLED, altrimenti e' "/".
+  static char otaRedirect[48];
+  snprintf(otaRedirect, sizeof(otaRedirect), "/%s", getAuthQuery().c_str());
+  MxOta.attachWeb(server, "/ota", otaRedirect, ensureAuthorized);
 
-  // /status resta SENZA autenticazione, di proposito: lo leggono il pannello
-  // di stato e il collettore dei dati, che non hanno un posto sicuro dove
-  // tenere un segreto. Non cambia niente sul device e non espone segreti -
-  // MxAuth.statusJson() dice COM'E' configurata l'auth, non i valori.
-  server.on("/status", HTTP_GET, sendStatusJson);
-
-  // Il guscio della pagina di configurazione si apre sempre; i VALORI
-  // arrivano da /config/data e il SALVATAGGIO vuole token e password.
-  server.on("/config",      HTTP_GET, []() { if (ensureAuthorized()) sendConfigPage(); });
-  server.on("/config/data", HTTP_GET, []() { if (MxAuth.checkConfig(server)) handleConfigData(); });
-  server.on("/config/save", HTTP_ANY, []() {
-    if (!MxAuth.checkAction(server)) return;
-    if (!MxAuth.checkConfig(server)) return;
-    handleConfigSave();
-  });
-
-  // Aggiornamento su richiesta, in POST. La rotta GET la registra la libreria
-  // qui sotto: con le azioni in solo-POST quella risponde 405 con l'Allow, e
-  // un segnalibro vecchio riceve un errore onesto invece di avviare un
-  // aggiornamento senza token.
-  server.on("/ota", HTTP_POST, []() {
-    if (!MxAuth.checkAction(server)) return;
-    MxOta.pending = true;   // il download parte dal loop(), l'handler non resta appeso
-    server.send(200, "application/json", "{\"ok\":true,\"action\":\"ota\"}");
-  });
-  MxOta.attachWeb(server, "/ota", "/", otaWebAuth);
-
-  server.on("/reboot", HTTP_ANY, []() {
-    if (!MxAuth.checkAction(server)) return;
-    addCommandLog(0, "RBT");   // il campo action e' char[4]
-    server.send(200, "application/json", "{\"ok\":true,\"action\":\"reboot\"}");
+  server.on("/reboot", HTTP_GET, []() {
+    if (!ensureAuthorized()) return;
+    startHtml("MxIrrigation - Reboot");
+    sendChunk("<h3>Rebooting...</h3><p>The device is restarting now.</p>");
+    endHtml();
     delay(500);
     ESP.restart();
   });
 
-  // Valvole. HTTP_ANY perche' il metodo lo decide MxAuth: cosi' una GET
-  // rimasta in un segnalibro riceve 405 con l'header Allow, che dice cosa e'
-  // cambiato, e non un 404 che sembra un guasto.
   for (int i = 0; i < VALVE_COUNT; i++) {
     const int idx = i;
     String onPath  = "/" + String(i + 1) + "/on";
     String offPath = "/" + String(i + 1) + "/off";
-    server.on(onPath.c_str(),  HTTP_ANY, [idx]() {
-      if (!MxAuth.checkAction(server)) return;
-      handleValveOn(idx);
-    });
-    server.on(offPath.c_str(), HTTP_ANY, [idx]() {
-      if (!MxAuth.checkAction(server)) return;
-      handleValveOff(idx);
-    });
+    server.on(onPath.c_str(),  HTTP_GET, [idx]() { handleValveOn(idx); });
+    server.on(offPath.c_str(), HTTP_GET, [idx]() { handleValveOff(idx); });
   }
 
   server.onNotFound([]() {
@@ -1283,37 +1017,6 @@ static void handleSerial() {
           ESP.restart();
         }
       }
-    } else if (strncmp(line, "auth ", 5) == 0) {
-      char* a = line + 5;
-      if (strncmp(a, "token ", 6) == 0) {
-        MxAuth.setToken(a + 6);
-      } else if (strcmp(a, "token off") == 0) {
-        MxAuth.setToken("");
-      } else if (strncmp(a, "cfgpw ", 6) == 0) {
-        MxAuth.setConfigPassword(a + 6);
-      } else if (strcmp(a, "cfgpw off") == 0) {
-        // Via d'uscita se la password della pagina si dimentica: senza
-        // questa non si entrerebbe piu' in configurazione nemmeno per
-        // disattivarla.
-        MxAuth.setConfigPassword("");
-      } else if (strcmp(a, "get on") == 0) {
-        MxAuth.setAllowGet(true);
-        Serial.println("[AUTH] accetto anche GET (compatibilita'). Il token, se richiesto,");
-        Serial.println("[AUTH] viaggia in query string: finisce nei log e nella cronologia.");
-      } else if (strcmp(a, "get off") == 0) {
-        MxAuth.setAllowGet(false);
-        Serial.println("[AUTH] solo POST");
-      } else if (strcmp(a, "require on") == 0) {
-        MxAuth.setRequireToken(true);
-      } else if (strcmp(a, "require off") == 0) {
-        MxAuth.setRequireToken(false);
-        Serial.println("[AUTH] *** token NON piu' richiesto: chiunque sulla LAN comanda.");
-      } else if (strcmp(a, "show") == 0) {
-        MxAuth.printTo(Serial);   // non stampa mai i segreti
-      } else {
-        Serial.println("uso: auth token <v> | token off | cfgpw <v> | cfgpw off |");
-        Serial.println("     get on|off | require on|off | show");
-      }
     } else if (strcmp(line, "ota") == 0) {
       MxOta.pending = true;
       Serial.println("[OTA] check richiesto");
@@ -1330,8 +1033,7 @@ static void handleSerial() {
     } else if (strcmp(line, "reboot") == 0) {
       ESP.restart();
     } else if (line[0]) {
-      Serial.println("comandi: id set / id show / wifi reset / status / board [id] /");
-      Serial.println("         auth ... / ota / v <n> on|off / reboot");
+      Serial.println("comandi: id set / id show / wifi reset / status / board [id] / ota / v <n> on|off / reboot");
     }
   }
 }
@@ -1412,15 +1114,6 @@ void setup() {
   registerRoutes();
   server.begin();
   Serial.println("[HTTP] server avviato sulla porta 80");
-
-  // Ultima riga che si legge all'avvio: se i comandi sono bloccati, o se il
-  // nodo e' aperto a chiunque, va detto qui e non sepolto piu' in alto.
-  if (MxAuth.misconfigured()) {
-    Serial.println("[AUTH] *** COMANDI VALVOLA BLOCCATI: manca il token.");
-    Serial.println("[AUTH]     impostalo adesso con:  auth token <valore>");
-  } else if (!MxAuth.requireToken()) {
-    Serial.println("[AUTH] *** nessun token: chiunque sulla LAN apre le valvole.");
-  }
 }
 
 void loop() {

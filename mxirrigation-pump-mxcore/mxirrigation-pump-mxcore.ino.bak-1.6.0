@@ -3,7 +3,7 @@
  * Progetto:    MxIrrigation - Pump Controller
  * File:        mxirrigation-pump-mxcore.ino
  * Autore:      Nicola Deboni - MxSolutions
- * Versione:    1.7.0
+ * Versione:    1.6.0
  * Ultima mod.: 2026-09-19
  * Repository:  vault "03 - Elettronica/Progetti/mxirrigation/firmware/
  *              mxirrigation-pump-mxcore" -> vedi [[pump-controller]]
@@ -46,37 +46,10 @@
  *   Flash:            QIO 80MHz, 4MB
  *
  *   Librerie (nome - versione esatta testata):
- *     MxSolutionCore  - 0.1.8   (0.1.6 per MxAuth, 0.1.8 per l'OTA che
- *                                funziona davvero: vedi la nota in fondo)
+ *     MxSolutionCore  - 0.1.4
  *     ESPping         - (quella già in uso dalla 1.3.0)
  *
  * Note di versione:
- *   2026-09-27      - Ricompilato su MxSolutionCore 0.1.8 (nessuna modifica a
- *                      questo sketch). Cosa cambia sotto: l'OTA accetta la
- *                      risposta CHUNKED, che e' quella che manda il server
- *                      mxota reale - prima il pull si fermava su "risposta
- *                      senza Content-Length" e nessun nodo poteva
- *                      aggiornarsi; i timeout di connessione e di attesa
- *                      degli header stanno sotto il timeout del watchdog
- *                      (prima 6+15 = 21 s contro 15: un server lento a
- *                      RISPONDERE riavviava il device); un campo vuoto nel
- *                      captive portale non cancella piu' la password
- *                      salvata; niente piu' "TWDT already initialized" a
- *                      ogni avvio.
- *   2026-09-26 1.7.0 - NUOVO: /status espone da QUANTO la pressione e' fuori
- *                      soglia (over_since_s, under_since_s) e quanti secondi
- *                      mancano allo stop automatico (secs_to_trip), piu' un
- *                      PREALLARME con margine configurabile da /config.
- *                      Serve al coordinatore MxScheduler, che dovra' tentare
- *                      l'autoriparazione PRIMA del trip: senza questi campi
- *                      vedrebbe solo "pressione fuori soglia" e dovrebbe
- *                      assumere il caso peggiore, buttando via meta' della
- *                      finestra utile.
- *                      I contatori esistevano gia' (overStartMs/underStartMs):
- *                      qui si espongono soltanto.
- *                      AGGIUNTA PURAMENTE INFORMATIVA: non tocca soglie,
- *                      tempi ne' stopAllPumps(). Il preallarme AVVISA, non
- *                      interviene e non rimanda niente.
  *   2026-09-20 1.6.0 - Le CINQUE temporizzazioni della sequenza di avvio non
  *                      sono piu' costanti scritte nel codice: si regolano da
  *                      /config e stanno in NVS. Erano numeri magici inline
@@ -146,7 +119,7 @@
 #include <ESPping.h>
 #include <esp_system.h>   // esp_reset_reason(): perche' e' ripartito
 
-const char* FW_VERSION = "1.7.0";
+const char* FW_VERSION = "1.6.0";
 
 // =========================================================================
 // CONFIGURAZIONE DI FABBRICA
@@ -174,7 +147,7 @@ IPAddress DNS2     (1, 1, 1, 1);
 // ATTENZIONE alla password ArduinoOTA: qui va una password NORMALE. NON
 // l'hash bcrypt di config.php del server mxota, che e' il segreto del pannello
 // di amministrazione e non deve finire nel binario di un device.
-const char* OTA_PASSWORD = "mxirr-6fquf15vxeow";
+const char* OTA_PASSWORD = "$2y$10$2U7O4S/degdXcsmHVfDPY.0cxqgMCBLYDIP3UNWaaU86.sO2Lk.iO";
 const char* OTA_HTTP_BASE = "https://www.mxsolutions.it/mxota/api.php";
 const char* OTA_FW_NAME   = "mxirrigation-pump";
 const char* OTA_TOKEN     = "wmpUpdate";
@@ -272,11 +245,6 @@ struct PumpConfig {
   uint32_t seqPump2Ms;   // pompa1 ON -> pompa2 ON         <- fra le due pompe
   uint32_t seqStag2Ms;   // pompa1 ON -> pompa2 ON         (modo sfalsato)
   uint32_t seqStagHoldMs;// quanto resta accesa pompa2     (modo sfalsato)
-
-  // Preallarme: quando mancano meno di questi secondi al trip, /status alza
-  // `prealarm` e la cosa finisce nel log eventi. 0 = disattivato.
-  // NON modifica il trip in alcun modo: avvisa e basta.
-  uint32_t prealarmS;
 };
 
 PumpConfig cfgp;
@@ -290,8 +258,7 @@ static const PumpConfig CFG_DEFAULT = {
   true,
   "192.168.5.40",
   true,           // notifica di avvio attiva di fabbrica
-  5000, 2000, 4000, 5000, 40000,  // i valori cablati fino alla 1.5.1
-  5                               // preallarme: 5 s prima del trip
+  5000, 2000, 4000, 5000, 40000   // i valori cablati fino alla 1.5.1
 };
 
 // Limiti di clamp. Fuori range si limita, non si rifiuta.
@@ -340,10 +307,6 @@ void cfgClamp(PumpConfig& c) {
   c.seqStag2Ms    = clampU32(c.seqStag2Ms,    0, CFG_SEQ_MS_MAX);
   c.seqStagHoldMs = clampU32(c.seqStagHoldMs, CFG_SEQ_HOLD_MS_MIN, CFG_SEQ_HOLD_MS_MAX);
 
-  // Il preallarme non puo' essere piu' lungo della finestra che precede il
-  // trip: sarebbe sempre attivo e non direbbe niente.
-  c.prealarmS = clampU32(c.prealarmS, 0, c.maxDelayS);
-
   if (c.pingHost[0] == '\0') {
     strncpy(c.pingHost, CFG_DEFAULT.pingHost, sizeof(c.pingHost) - 1);
     c.pingHost[sizeof(c.pingHost) - 1] = '\0';
@@ -367,7 +330,6 @@ void cfgLoad() {
   cfgp.seqPump2Ms    = prefs.getULong("seqPump2",   CFG_DEFAULT.seqPump2Ms);
   cfgp.seqStag2Ms    = prefs.getULong("seqStag2",   CFG_DEFAULT.seqStag2Ms);
   cfgp.seqStagHoldMs = prefs.getULong("seqStagHold",CFG_DEFAULT.seqStagHoldMs);
-  cfgp.prealarmS     = prefs.getULong("prealarm",   CFG_DEFAULT.prealarmS);
   prefs.end();
   cfgClamp(cfgp);
 }
@@ -389,7 +351,6 @@ void cfgSave() {
   prefs.putULong ("seqPump2",   cfgp.seqPump2Ms);
   prefs.putULong ("seqStag2",   cfgp.seqStag2Ms);
   prefs.putULong ("seqStagHold",cfgp.seqStagHoldMs);
-  prefs.putULong ("prealarm",   cfgp.prealarmS);
   prefs.end();
 }
 
@@ -418,10 +379,6 @@ bool bootNotifySent = false;
 
 unsigned long overStartMs = 0;  // da quando siamo sopra soglia
 unsigned long underStartMs = 0; // da quando siamo sotto soglia
-
-// Preallarme: alzato quando manca poco al trip, azzerato appena la pressione
-// rientra. Serve solo a segnalare - il trip resta quello di sempre.
-bool prealarmActive = false;
 
 String pressureTripLog = "";
 String lowPressureTripLog = "";
@@ -790,45 +747,6 @@ void serviceBootNotification() {
   addEventLog("BOOT: notifica ntfy inviata");
 }
 
-// Da quanti secondi siamo fuori soglia, e quanti ne mancano allo stop.
-// Sono i contatori che il firmware gia' teneva per decidere il trip: qui si
-// leggono soltanto, senza toccarli.
-uint32_t overSinceS()  { return overStartMs  ? (millis() - overStartMs)  / 1000UL : 0; }
-uint32_t underSinceS() { return underStartMs ? (millis() - underStartMs) / 1000UL : 0; }
-
-// Secondi mancanti allo stop automatico. -1 = nessun conto alla rovescia in
-// corso: il chiamante lo rende come null, che e' diverso da "zero secondi".
-long secsToTrip() {
-  if (overStartMs) {
-    long r = (long)cfgp.maxDelayS - (long)overSinceS();
-    return r > 0 ? r : 0;
-  }
-  if (underStartMs) {
-    long r = (long)cfgp.minDelayS - (long)underSinceS();
-    return r > 0 ? r : 0;
-  }
-  return -1;
-}
-
-// Aggiorna il preallarme. Chiamata dal loop DOPO i due controlli di trip,
-// cosi' legge i contatori aggiornati dello stesso giro.
-//
-// Non ha alcun effetto sulle pompe: alza un flag, scrive una riga di log al
-// fronte di salita, e basta. Il trip resta autonomo e resta l'ultima parola.
-void servicePrealarm() {
-  if (cfgp.prealarmS == 0) { prealarmActive = false; return; }
-
-  long left = secsToTrip();
-  bool now  = (left >= 0 && left <= (long)cfgp.prealarmS);
-
-  if (now && !prealarmActive) {
-    // Solo sul fronte: altrimenti riempirebbe il log una riga al secondo.
-    addEventLog("PREALLARME: " + String(left) + " s allo stop, "
-                + String(valore, 2) + " bar");
-  }
-  prealarmActive = now;
-}
-
 void checkHighPressureTrip() {
   uint16_t cb = rawToCentibar(raw);
 
@@ -1023,15 +941,6 @@ void runPumpSequencer() {
 // Il watchdog della libreria sorveglia solo il task del loop(), quindi un
 // task di rete lento non lo fa scattare: è esattamente il caso per cui
 // MxWatchdog è fatto così.
-//
-// ⚠️ MxSolutionCore 0.1.8 aggiunge MxWatchdog.watch(task), che permette di
-// sorvegliare anche i task dello sketch. QUI NON SI USA, di proposito:
-// questo task sta fermo su ulTaskNotifyTake(portMAX_DELAY) per ore, in
-// attesa che il loop() gli chieda un ping. Un task sorvegliato deve
-// chiamare feed() a intervalli regolari, quindi registrarlo farebbe
-// scattare il watchdog al primo periodo di calma - un riavvio causato dal
-// fatto che tutto funziona. watch() serve ai task che lavorano in
-// continuazione, non a quelli che dormono aspettando lavoro.
 
 void pingTaskFn(void* arg) {
   (void)arg;
@@ -1097,27 +1006,6 @@ String pageHead(const char* title) {
   h += "<!DOCTYPE HTML><html><head>";
   h += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
   h += "<meta http-equiv='Cache-Control' content='no-cache, no-store, must-revalidate'>";
-
-  // Il token sta nel localStorage del BROWSER e viaggia in un header, mai
-  // nell'URL: cosi' non finisce nella cronologia, nei log del server ne' nel
-  // Referer. Nessuna sessione lato ESP32, nessun cookie, nessuno stato da
-  // tenere su un dispositivo che ha poca memoria.
-  h += "<script>"
-       "function mxTok(f){var t=localStorage.getItem('mxtoken')||'';"
-       "if(!t||f){t=prompt('Token del nodo:',t)||'';"
-       "if(t)localStorage.setItem('mxtoken',t);}return t;}"
-       "function mxCfg(f){var t=localStorage.getItem('mxcfgpw')||'';"
-       "if(!t||f){t=prompt('Password della pagina di configurazione:',t)||'';"
-       "if(t)localStorage.setItem('mxcfgpw',t);}return t;}"
-       "async function mxPost(p,body){"
-       "var r=await fetch(p,{method:'POST',headers:{'X-Mx-Token':mxTok(false),"
-       "'X-Mx-Cfg':localStorage.getItem('mxcfgpw')||'',"
-       "'Content-Type':'application/x-www-form-urlencoded'},body:body||''});"
-       "if(r.status===401){var j=await r.json().catch(function(){return {};});"
-       "alert('Non autorizzato'+(j.hint?': '+j.hint:'.'));mxTok(true);return null;}"
-       "if(!r.ok){alert('Errore '+r.status);return null;}return r;}"
-       "async function mxCmd(p){var r=await mxPost(p);if(r)location.reload();}"
-       "</script>";
   h += "<meta http-equiv='Expires' content='0'>";
   h += "<title>";
   h += title;
@@ -1165,13 +1053,13 @@ void handleRoot() {
     String q = pwQuery();
     if (busy) {
       h += "<br><br><font color=gray>Pompe in funzione o avvio in corso: e' possibile solo lo spegnimento.</font>";
-      h += "<br><br><button onclick=\"mxCmd('/master/off')\">SPEGNI</button>";
+      h += "<br><br><a href='/master/off" + q + "'>SPEGNI</a>";
     } else {
-      h += "<br><br><button onclick=\"mxCmd('/master/on')\">Accendi entrambe</button>";
-      h += "<br><br><button onclick=\"mxCmd('/master-solar/on')\">Accendi master solar</button>";
-      h += "<br><br><button onclick=\"mxCmd('/single')\">Accendi singola</button>";
-      h += "<br><br><button onclick=\"mxCmd('/staggered-auto')\">Doppia sfalsata</button>";
-      h += "<br><br><button onclick=\"mxCmd('/master/off')\">SPEGNI</button>";
+      h += "<br><br><a href='/master/on" + q + "'>Accendi entrambe</a>";
+      h += "<br><br><a href='/master-solar/on" + q + "'>Accendi master solar</a>";
+      h += "<br><br><a href='/single" + q + "'>Accendi singola</a>";
+      h += "<br><br><a href='/staggered-auto" + q + "'>Doppia sfalsata 5 s / seconda off dopo 40 s</a>";
+      h += "<br><br><a href='/master/off" + q + "'>SPEGNI</a>";
     }
     h += "<br><br><button onclick=\"if(confirm('Riavviare il controller?')){window.location='/reboot" + q + "';}\">Riavvia</button>";
   }
@@ -1209,22 +1097,6 @@ void handleInfo() {
      + String(otaHttpUrl[0] ? " (fw " + String(OTA_FW_NAME) + ")" : "") + "\n";
   h += "Ping            : " + String(cfgp.pingEnabled ? "attivo verso " : "disattivato (")
      + String(cfgp.pingHost) + String(cfgp.pingEnabled ? "" : ")") + "\n";
-  h += "Azioni          : " + String(MxAuth.allowGet() ? "POST e GET (compatibilita')" : "solo POST") + "\n";
-  h += "Token           : " + String(!MxAuth.requireToken()
-                                ? "NON richiesto - chiunque sulla LAN comanda"
-                                : (MxAuth.tokenSet() ? "richiesto, impostato"
-                                                     : "RICHIESTO MA NON IMPOSTATO - azioni bloccate")) + "\n";
-  h += "Pagina config   : " + String(MxAuth.configPwSet() ? "protetta" : "aperta") + "\n";
-  h += "Preallarme      : " + String(cfgp.prealarmS == 0 ? "disattivato"
-                                   : String(cfgp.prealarmS) + " s prima dello stop")
-     + String(prealarmActive ? "  [ATTIVO ORA]" : "") + "\n";
-  {
-    long t = secsToTrip();
-    h += "Fuori soglia    : " + String(t < 0 ? String("no")
-           : String(overStartMs ? "alta da " : "bassa da ")
-             + String(overStartMs ? overSinceS() : underSinceS())
-             + " s, stop fra " + String(t) + " s") + "\n";
-  }
   h += "Notifica avvio  : " + String(!cfgp.bootNotify ? "disattivata"
                                    : bootNotifySent   ? "attiva, gia' inviata"
                                                       : "attiva, in attesa di rete/ora") + "\n";
@@ -1364,7 +1236,7 @@ void handleConfig() {
          "riportati al limite piu' vicino.</p>";
   }
 
-  h += "<form id='cfgform' onsubmit='return mxSaveCfg(event)'>";
+  h += "<form method='POST' action='/config/save" + q + "'>";
   h += "<table class=cfg>";
 
   h += "<tr><td colspan=2><b>Allarme di pressione</b></td></tr>";
@@ -1390,18 +1262,6 @@ void handleConfig() {
        "ricarica questa pagina, copia il valore qui sopra nel campo "
        "<i>Valore sensore</i> e scrivi accanto la pressione del manometro.<br>"
        "La curva e' lineare e passa per lo zero.</td></tr>";
-
-  h += "<tr><td colspan=2><br><b>Preallarme</b></td></tr>";
-  h += "<tr><td>Avvisa quando mancano</td><td><input type=number min=0 name='prealarm' value='"
-     + String(cfgp.prealarmS) + "'> s allo stop</td></tr>";
-  h += "<tr><td colspan=2 class=hint>Quando manca meno di questo tempo allo spegnimento "
-       "automatico, <code>/status</code> alza <code>prealarm</code> e la cosa finisce nel "
-       "log eventi con la pressione del momento. <b>0 = disattivato.</b><br>"
-       "Serve al coordinatore per tentare di rimediare <i>prima</i> che le pompe si fermino "
-       "(per esempio riaprendo una valvola che non si e' aperta).<br>"
-       "<b>Non cambia nulla del comportamento delle pompe</b>: avvisa e basta, le protezioni "
-       "restano quelle di sempre. Non puo' superare l'attesa dell'allarme alta pressione ("
-     + String(cfgp.maxDelayS) + " s), altrimenti sarebbe sempre attivo.</td></tr>";
 
   h += "<tr><td colspan=2><br><b>Tempi della sequenza di avvio</b></td></tr>";
   h += seqRow("Rele' 4 -> master",  "seqrelay4",  cfgp.seqRelay4Ms);
@@ -1450,69 +1310,7 @@ void handleConfig() {
        "<b>Attenzione</b>: se il controller entra in ciclo di riavvii (per esempio col ping "
        "attivo verso un host spento) arriva <b>una notifica per ogni riavvio</b>.</td></tr>";
 
-  h += "<tr><td colspan=2><br><b>Sicurezza</b></td></tr>";
-
-  h += "<tr><td>Metodo delle azioni</td><td>"
-       "<label><input type=radio name='authget' value='0'";
-  if (!MxAuth.allowGet()) h += " checked";
-  h += "> solo POST</label><br>"
-       "<label><input type=radio name='authget' value='1'";
-  if (MxAuth.allowGet()) h += " checked";
-  h += "> POST e GET</label></td></tr>";
-
-  h += "<tr><td>Token richiesto</td><td><input type=checkbox name='authreq' value='1'";
-  if (MxAuth.requireToken()) h += " checked";
-  h += "></td></tr>";
-
-  h += "<tr><td>Token</td><td><input type=text name='authtok' placeholder='"
-     + String(MxAuth.tokenSet() ? "impostato - scrivi per cambiarlo" : "NON impostato")
-     + "'></td></tr>";
-
-  h += "<tr><td>Password di questa pagina</td><td><input type=text name='authcfgpw' placeholder='"
-     + String(MxAuth.configPwSet() ? "impostata - scrivi per cambiarla" : "non impostata")
-     + "'></td></tr>";
-
-  h += "<tr><td colspan=2 class=hint>"
-       "<b>Solo POST</b> e' il modo sicuro: un comando non si puo' piu' mettere in un "
-       "segnalibro, ne' innescare con un prefetch del browser o una &lt;img src&gt; in una "
-       "pagina qualunque.<br>"
-       "<b>POST e GET</b> serve solo durante la transizione, per non rompere script e "
-       "segnalibri che esistono gia'. ⚠️ In quella modalita' il token viaggia in query "
-       "string, quindi finisce nei log del server, nella cronologia del browser e "
-       "nell'header Referer: e' un ripiego, non un pari grado.<br>"
-       "<b>Togliendo il token</b> si torna al comportamento di prima: chiunque sulla rete "
-       "locale comanda le pompe.<br>"
-       "I campi del token e della password si lasciano vuoti per non cambiarli. Per "
-       "cancellarli, o se la password di questa pagina si perde, si usa la seriale: "
-       "<code>auth token off</code>, <code>auth cfgpw off</code>."
-       "</td></tr>";
-
   h += "</table><br><button type=submit>Salva</button></form>";
-
-  // Salvataggio via fetch: il token e la password della pagina viaggiano in
-  // header. E i VALORI correnti si caricano da /config/data, perche' un
-  // browser che NAVIGA non puo' mettere header: la pagina si apre sempre, i
-  // valori arrivano solo a chi ha la password.
-  h += "<script>"
-       "async function mxSaveCfg(e){e.preventDefault();"
-       "var f=document.getElementById('cfgform');"
-       "var r=await mxPost('/config/save',new URLSearchParams(new FormData(f)).toString());"
-       "if(r){alert('Configurazione salvata');location.reload();}return false;}"
-       "(async function(){"
-       "var h={'X-Mx-Cfg':localStorage.getItem('mxcfgpw')||''};"
-       "var r=await fetch('/config/data',{headers:h});"
-       "if(r.status===401){mxCfg(true);"
-       "r=await fetch('/config/data',{headers:{'X-Mx-Cfg':localStorage.getItem('mxcfgpw')||''}});}"
-       "if(!r.ok){document.getElementById('cfgnote').textContent="
-       "'Valori non disponibili: password della pagina mancante o errata.';return;}"
-       "var d=await r.json();"
-       "document.getElementById('cfgnote').textContent="
-       "'Token: '+(d.auth.token_set?'impostato':'NON impostato')+"
-       "' - azioni: '+(d.auth.allow_get?'POST e GET':'solo POST')+"
-       "(d.auth.misconfigured?' - ATTENZIONE: azioni bloccate':'');"
-       "})();"
-       "</script>";
-  h += "<p class=hint id='cfgnote'></p>";
 
   h += "<p class=hint>I valori sono salvati in NVS e sopravvivono al riavvio e "
        "all'aggiornamento OTA. Il reset di fabbrica del WiFi non li cancella.</p>";
@@ -1536,17 +1334,6 @@ void handleConfigSave() {
   if (server.hasArg("seqpump2"))    cfgp.seqPump2Ms    = (uint32_t)lroundf(server.arg("seqpump2").toFloat()    * 1000.0f);
   if (server.hasArg("seqstag2"))    cfgp.seqStag2Ms    = (uint32_t)lroundf(server.arg("seqstag2").toFloat()    * 1000.0f);
   if (server.hasArg("seqstaghold")) cfgp.seqStagHoldMs = (uint32_t)lroundf(server.arg("seqstaghold").toFloat() * 1000.0f);
-  if (server.hasArg("prealarm"))    cfgp.prealarmS     = (uint32_t)server.arg("prealarm").toInt();
-
-  // Sicurezza. Arriva qui solo chi ha gia' superato checkAction + checkConfig:
-  // senza quello, chiunque sulla LAN potrebbe rimettere "GET senza token"
-  // dalla pagina stessa - il lucchetto sulla porta con la chiave appesa fuori.
-  if (server.hasArg("authget")) MxAuth.setAllowGet(server.arg("authget") == "1");
-  MxAuth.setRequireToken(server.hasArg("authreq"));
-  if (server.hasArg("authtok") && server.arg("authtok").length())
-    MxAuth.setToken(server.arg("authtok").c_str());
-  if (server.hasArg("authcfgpw") && server.arg("authcfgpw").length())
-    MxAuth.setConfigPassword(server.arg("authcfgpw").c_str());
   if (server.hasArg("pinghost")) {
     String ph = server.arg("pinghost");
     ph.trim();
@@ -1604,24 +1391,6 @@ void handleStatusJson() {
   h += "\"alarm_low\":" + String(lowPressureTripLog.length() ? "true" : "false") + ",";
   h += "\"samples\":" + String(pressHistCount) + ",";
 
-  // Da quanto siamo fuori soglia e quanto manca allo stop automatico.
-  // Serve al coordinatore per tentare l'autoriparazione PRIMA del trip:
-  // senza, dovrebbe assumere che il conto alla rovescia sia partito subito
-  // dopo la sua ultima lettura, e su 20 s di finestra ne butterebbe meta'.
-  h += "\"over_since_s\":" + String(overSinceS()) + ",";
-  h += "\"under_since_s\":" + String(underSinceS()) + ",";
-  {
-    long t = secsToTrip();
-    // null, non 0: "nessun conto alla rovescia" e' diverso da "ci siamo".
-    h += "\"secs_to_trip\":" + (t < 0 ? String("null") : String(t)) + ",";
-  }
-  h += "\"prealarm\":" + String(prealarmActive ? "true" : "false") + ",";
-  h += "\"prealarm_s\":" + String(cfgp.prealarmS) + ",";
-
-  // Come e' configurata l'autenticazione. Serve al coordinatore e al pannello
-  // per accorgersi - e segnalare - che un nodo e' rimasto aperto o bloccato.
-  h += MxAuth.statusJson() + ",";
-
   // Stato dei quattro relè, nell'ordine della scheda.
   h += "\"relays\":[";
   for (int i = 0; i < numRelays; i++) {
@@ -1642,106 +1411,47 @@ void handleReboot() {
   ESP.restart();
 }
 
-// Risposta di un comando accettato. Non piu' un redirect 303: i pulsanti
-// ora fanno fetch() e ricaricano da soli, e un client come lo scheduler
-// vuole una risposta che si possa leggere, non una pagina.
-void sendActionOk(const char* what) {
-  String b = String("{\"ok\":true,\"action\":\"") + what + "\","
-           + "\"master_on\":" + String(masterOn ? "true" : "false") + ","
-           + "\"pressure_bar\":" + String(valore, 2) + "}";
-  server.send(200, "application/json", b);
-}
-
-// Valori correnti della configurazione, per la pagina. Separati dal guscio
-// HTML perche' un browser che NAVIGA non puo' mettere header: la pagina si
-// apre sempre, i valori arrivano solo a chi ha la password.
-void handleConfigData() {
-  String h = "{";
-  h += "\"max_bar\":"   + String(cfgp.maxCb / 100.0f, 2) + ",";
-  h += "\"max_delay\":" + String(cfgp.maxDelayS) + ",";
-  h += "\"min_bar\":"   + String(cfgp.minCb / 100.0f, 2) + ",";
-  h += "\"min_delay\":" + String(cfgp.minDelayS) + ",";
-  h += "\"cal_raw\":"   + String(cfgp.calRaw) + ",";
-  h += "\"cal_bar\":"   + String(cfgp.calCb / 100.0f, 2) + ",";
-  h += "\"raw_now\":"   + String(raw) + ",";
-  h += "\"ping_on\":"   + String(cfgp.pingEnabled ? "true" : "false") + ",";
-  h += "\"ping_host\":\"" + String(cfgp.pingHost) + "\",";
-  h += "\"boot_ntfy\":" + String(cfgp.bootNotify ? "true" : "false") + ",";
-  h += "\"prealarm\":"  + String(cfgp.prealarmS) + ",";
-  h += "\"seq\":[" + String(cfgp.seqRelay4Ms) + "," + String(cfgp.seqMasterMs) + ","
-                    + String(cfgp.seqPump2Ms)  + "," + String(cfgp.seqStag2Ms)  + ","
-                    + String(cfgp.seqStagHoldMs) + "],";
-  h += MxAuth.statusJson();
-  h += "}";
-  server.send(200, "application/json", h);
-}
-
 void registerRoutes() {
-  // ⚠️ Senza questa, il WebServer dell'ESP32 SCARTA gli header custom e
-  // server.header("X-Mx-Token") torna sempre vuoto: ogni comando verrebbe
-  // rifiutato con 401 e sembrerebbe un problema di token.
-  MxAuth.collectHeaders(server);
-
-  // --- SOLA LETTURA: restano GET, nessun token ------------------------------
   server.on("/",         HTTP_GET, []() { if (ensureAuthorized()) handleRoot(); });
   server.on("/info",     HTTP_GET, []() { if (ensureAuthorized()) handleInfo(); });
   server.on("/logs",     HTTP_GET, []() { if (ensureAuthorized()) handleLogs(); });
   server.on("/pressure", HTTP_GET, []() { if (ensureAuthorized()) handlePressure(); });
-
-  // /status resta SENZA auth: è letto dal pannello di stato e dal collettore,
-  // che espongono solo dati in lettura (nessun comando).
+  server.on("/config",   HTTP_GET, []() { if (ensureAuthorized()) handleConfig(); });
+  server.on("/config/save", HTTP_POST, handleConfigSave);
+  // /status resta SENZA auth: è letto dal pannello di stato, che non ha modo
+  // di autenticarsi, ed espone solo dati in lettura (nessun comando).
   server.on("/status",   HTTP_GET, handleStatusJson);
+  server.on("/reboot",   HTTP_GET, handleReboot);
 
-  // --- CONFIGURAZIONE: guscio libero, valori e salvataggio protetti ---------
-  // La pagina si apre sempre (un browser che naviga non può mettere header);
-  // i VALORI arrivano da /config/data e il SALVATAGGIO vuole la password.
-  server.on("/config",      HTTP_GET,  []() { if (ensureAuthorized()) handleConfig(); });
-  server.on("/config/data", HTTP_GET,  []() { if (MxAuth.checkConfig(server)) handleConfigData(); });
-  server.on("/config/save", HTTP_ANY,  []() {
-    // Salvare la configurazione È un'azione: vuole il token come le altre, e
-    // in più la password della pagina se impostata. Senza questo, chiunque
-    // sulla LAN rimetterebbe "GET senza token" dalla pagina stessa.
-    if (!MxAuth.checkAction(server)) return;
-    if (!MxAuth.checkConfig(server)) return;
-    handleConfigSave();
-  });
-
-  // --- AZIONI: POST + token (o GET se il nodo è in compatibilità) -----------
-  // Registrate come HTTP_ANY perché il metodo lo decide MxAuth: così una GET
-  // su una rotta diventata POST riceve 405 con "Allow: POST", e non un 404
-  // che farebbe pensare a un device rotto.
-  server.on("/reboot", HTTP_ANY, []() {
-    if (!MxAuth.checkAction(server)) return;
-    handleReboot();
-  });
-
-  server.on("/master/on", HTTP_ANY, []() {
-    if (!MxAuth.checkAction(server) || rejectIfPumpsBusy()) return;
+  server.on("/master/on", HTTP_GET, []() {
+    if (!ensureAuthorized() || rejectIfPumpsBusy()) return;
     queueStartMode(START_MASTER_BOTH, "master/on");
-    sendActionOk("master/on");
+    server.sendHeader("Location", "/" + pwQuery());
+    server.send(303, "text/plain", "See Other");
   });
-  server.on("/master-solar/on", HTTP_ANY, []() {
-    if (!MxAuth.checkAction(server) || rejectIfPumpsBusy()) return;
+  server.on("/master-solar/on", HTTP_GET, []() {
+    if (!ensureAuthorized() || rejectIfPumpsBusy()) return;
     queueStartMode(START_MASTER_SOLAR_BOTH, "master-solar/on");
-    sendActionOk("master-solar/on");
+    server.sendHeader("Location", "/" + pwQuery());
+    server.send(303, "text/plain", "See Other");
   });
-  server.on("/single", HTTP_ANY, []() {
-    if (!MxAuth.checkAction(server) || rejectIfPumpsBusy()) return;
+  server.on("/single", HTTP_GET, []() {
+    if (!ensureAuthorized() || rejectIfPumpsBusy()) return;
     queueStartMode(START_SINGLE_ONLY, "single");
-    sendActionOk("single");
+    server.sendHeader("Location", "/" + pwQuery());
+    server.send(303, "text/plain", "See Other");
   });
-  server.on("/staggered-auto", HTTP_ANY, []() {
-    if (!MxAuth.checkAction(server) || rejectIfPumpsBusy()) return;
+  server.on("/staggered-auto", HTTP_GET, []() {
+    if (!ensureAuthorized() || rejectIfPumpsBusy()) return;
     queueStartMode(START_STAGGERED_AUTO_OFF, "staggered-auto");
-    sendActionOk("staggered-auto");
+    server.sendHeader("Location", "/" + pwQuery());
+    server.send(303, "text/plain", "See Other");
   });
-  server.on("/master/off", HTTP_ANY, []() {
-    if (!MxAuth.checkAction(server)) return;
-    // Lo stop è IDEMPOTENTE di proposito: chiedere di spegnere pompe già
-    // ferme è un successo, non un errore. Il coordinatore ritenterà dopo
-    // ogni comando non confermato, e ritentare non deve rompere niente.
+  server.on("/master/off", HTTP_GET, []() {
+    if (!ensureAuthorized()) return;
     pendingStop = true;
-    sendActionOk("master/off");
+    server.sendHeader("Location", "/" + pwQuery());
+    server.send(303, "text/plain", "See Other");
   });
 
   // Rotta /ota registrata dalla libreria, con l'auth di questo progetto.
@@ -1808,40 +1518,6 @@ static void handleSerial() {
                     msText(cfgp.seqRelay4Ms).c_str(), msText(cfgp.seqMasterMs).c_str(),
                     msText(cfgp.seqPump2Ms).c_str(),  msText(cfgp.seqStag2Ms).c_str(),
                     msText(cfgp.seqStagHoldMs).c_str());
-      Serial.printf("[CFG] preallarme=%lu s  (adesso: %s)\n",
-                    (unsigned long)cfgp.prealarmS,
-                    prealarmActive ? "ATTIVO" : "no");
-    } else if (strncmp(line, "auth ", 5) == 0) {
-      char* a = line + 5;
-      if (strncmp(a, "token ", 6) == 0) {
-        MxAuth.setToken(a + 6);
-      } else if (strcmp(a, "token off") == 0) {
-        MxAuth.setToken("");
-      } else if (strncmp(a, "cfgpw ", 6) == 0) {
-        MxAuth.setConfigPassword(a + 6);
-      } else if (strcmp(a, "cfgpw off") == 0) {
-        // Via d'uscita se la password della pagina si dimentica: senza
-        // questa, con [C] attiva non si entrerebbe piu' in configurazione
-        // nemmeno per disattivarla.
-        MxAuth.setConfigPassword("");
-      } else if (strcmp(a, "get on") == 0) {
-        MxAuth.setAllowGet(true);
-        Serial.println("[AUTH] accetto anche GET (compatibilita'). Il token, se richiesto,");
-        Serial.println("[AUTH] viaggia in query string: finisce nei log e nella cronologia.");
-      } else if (strcmp(a, "get off") == 0) {
-        MxAuth.setAllowGet(false);
-        Serial.println("[AUTH] solo POST");
-      } else if (strcmp(a, "require on") == 0) {
-        MxAuth.setRequireToken(true);
-      } else if (strcmp(a, "require off") == 0) {
-        MxAuth.setRequireToken(false);
-        Serial.println("[AUTH] *** token NON piu' richiesto: chiunque sulla LAN comanda.");
-      } else if (strcmp(a, "show") == 0) {
-        MxAuth.printTo(Serial);   // non stampa mai i segreti
-      } else {
-        Serial.println("uso: auth token <v> | token off | cfgpw <v> | cfgpw off |");
-        Serial.println("     get on|off | require on|off | show");
-      }
     } else if (strcmp(line, "cfg reset") == 0) {
       cfgp = CFG_DEFAULT;
       cfgSave();
@@ -1860,8 +1536,7 @@ static void handleSerial() {
     } else if (strcmp(line, "reboot") == 0) {
       ESP.restart();
     } else if (line[0]) {
-      Serial.println("comandi: id set / id show / wifi reset / status / cfg / cfg reset /");
-      Serial.println("         auth ... / boot ntfy / ota / off / reboot");
+      Serial.println("comandi: id set / id show / wifi reset / status / cfg / cfg reset / boot ntfy / ota / off / reboot");
     }
   }
 }
@@ -1949,12 +1624,6 @@ void setup() {
     cfgp.pingEnabled = false;
   }
 
-  if (MxAuth.misconfigured()) {
-    addEventLog("AVVIO: azioni BLOCCATE, token richiesto ma non impostato");
-  } else if (!MxAuth.requireToken()) {
-    addEventLog("AVVIO: nessun token richiesto, comandi aperti sulla LAN");
-  }
-
   registerRoutes();
   server.begin();
   Serial.println("[HTTP] server avviato sulla porta 80");
@@ -1994,7 +1663,6 @@ void loop() {
 
     checkHighPressureTrip();
     checkLowPressureTripWhilePumpsOn();
-    servicePrealarm();   // [5] legge i contatori, non li tocca
   }
 
   // LED: acceso fisso con la rete su, lampeggio se manca.
