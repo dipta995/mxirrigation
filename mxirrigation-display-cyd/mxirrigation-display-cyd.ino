@@ -3,8 +3,8 @@
  * Progetto:    MxIrrigation - Pannello di stato
  * File:        mxirrigation-display-cyd.ino
  * Autore:      Nicola Deboni - MxSolutions
- * Versione:    1.3.0
- * Ultima mod.: 2026-09-19
+ * Versione:    1.3.1
+ * Ultima mod.: 2026-10-17
  * Repository:  vault "03 - Elettronica/Progetti/mxirrigation/firmware/
  *              mxirrigation-display-cyd" -> vedi [[status-display]] e
  *              [[mxirrigation]]
@@ -66,7 +66,7 @@
  *   PSRAM:            disabilitata (la 2432S028R non ne ha)
  *
  *   Librerie (nome - versione esatta testata):
- *     MxSolutionCore  - 0.1.8   (0.1.6 per MxAuth, 0.1.8 per l'OTA che
+ *     MxSolutionCore  - 0.1.11  (0.1.6 per MxAuth, 0.1.8 per l'OTA che
  *                                funziona davvero: vedi la nota in fondo)
  *     LovyanGFX       - 1.2.29   (la 1.1.12 NON compila col core esp32 3.x:
  *                                il ramo legacy v0 si compila sempre e usa API
@@ -79,6 +79,13 @@
  *   sketch TTGO T-Display e T4, e cambiarla li romperebbe.
  *
  * Note di versione:
+ *   2026-10-17 1.3.1 - La password ArduinoOTA non sta piu' in chiaro: nel
+ *                      sorgente c'e' solo lo SHA-256 (setPasswordHash). Da
+ *                      IDE/espota si digita la stessa password di prima.
+ *                    - (23/10, prima del rilascio) Compilata su
+ *                      MxSolutionCore 0.1.11: nome del prodotto
+ *                      "MxIrrigation Display by MxSolutions" nel titolo, in
+ *                      testa e in fondo alle pagine e nel portale WiFi.
  *   2026-09-27      - Ricompilato su MxSolutionCore 0.1.8 (nessuna modifica a
  *                      questo sketch). Cosa cambia sotto: l'OTA accetta la
  *                      risposta CHUNKED, che e' quella che manda il server
@@ -127,6 +134,7 @@
  */
 
 #include <MxCore.h>
+#include <ArduinoOTA.h>   // setPasswordHash(): la password OTA solo come hash
 #include <WiFi.h>          // WiFiClient: MxCore non lo espone di suo
 #include <WebServer.h>
 #include <HTTPClient.h>
@@ -136,7 +144,10 @@
 #define LGFX_USE_V1
 #include <LovyanGFX.hpp>
 
-const char* FW_VERSION = "1.3.0";
+const char* FW_VERSION = "1.3.1";
+// Nome del prodotto: le pagine e il portale WiFi mostrano
+// "MxIrrigation Display by MxSolutions" (core 0.1.11).
+const char* PRODUCT_NAME = "MxIrrigation Display";
 
 // --- OTA: DA RIEMPIRE PRIMA DEL FLASH ------------------------------------
 // Il pannello sta a muro o su un palo: e' il nodo per cui salire col cavo
@@ -162,7 +173,12 @@ const char* FW_VERSION = "1.3.0";
 // ATTENZIONE alla password ArduinoOTA: qui va una password NORMALE. NON
 // l'hash bcrypt di config.php del server mxota, che e' il segreto del pannello
 // di amministrazione e non deve finire nel binario di un device.
-const char* OTA_PASSWORD = "mxirr-6fquf15vxeow";
+// Dalla 1.3.1 qui sta solo lo SHA-256 della password (64 caratteri hex), non
+// la password: chi legge il sorgente o il binario non la ricava. Dall'IDE o da
+// espota si digita la password vera, come prima. Per cambiarla:
+//   printf '%s' 'nuova-password' | sha256sum
+// Serve l'esp32 core 3.x (setPasswordHash accetta lo SHA-256 dalla 3.3).
+const char* OTA_PASSWORD_SHA256 = "00716367709476a6126eccbc51b455d5d15044f44f1d25bc192178ab0eb938c1";
 const char* OTA_HTTP_BASE = "https://www.mxsolutions.it/mxota/api.php";
 const char* OTA_FW_NAME   = "mxirrigation-display";
 const char* OTA_TOKEN     = "wmpUpdate";
@@ -907,6 +923,19 @@ void serviceTouch() {
 // PAGINA WEB DI CONFIGURAZIONE
 // =========================================================================
 
+// "MxIrrigation Display by MxSolutions": nel titolo della scheda, in testa e in fondo
+// a ogni pagina (regola MxSolutions, core 0.1.11).
+String brandStr() {
+  char b[80];
+  MxCore.brand(b, sizeof(b));
+  return String(b);
+}
+
+String brandFoot() {
+  return "<p style='color:#666;font-size:12px'>" + brandStr()
+         + " &middot; firmware " + String(FW_VERSION) + "</p>";
+}
+
 String htmlEscape(const String& s) {
   String o;
   for (size_t i = 0; i < s.length(); i++) {
@@ -925,13 +954,14 @@ void handleConfigPage() {
   h.reserve(4096);
   h += "<!DOCTYPE HTML><html><head><meta charset='utf-8'>";
   h += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
-  h += "<title>MxIrrigation - Pannello</title><style>"
+  h += "<title>Pannello - " + brandStr() + "</title><style>"
        "body{font-family:Arial,sans-serif;font-size:14px;margin:12px}"
        "table{border-collapse:collapse;width:100%;max-width:760px}"
        "td,th{padding:6px;border-bottom:1px solid #ddd;text-align:left}"
        "input[type=text]{padding:4px;width:100%;box-sizing:border-box}"
        "input[type=number]{padding:4px;width:7em}"
        ".hint{color:#666;font-size:12px}</style></head><body>";
+  h += "<p><b>" + brandStr() + "</b></p>";
   h += "<h2>Pannello MxIrrigation</h2>";
 
   if (server.hasArg("saved")) h += "<p style='color:green'><b>Salvato.</b></p>";
@@ -990,12 +1020,13 @@ void handleConfigPage() {
   h += "<br><button type=submit>Salva</button></form>";
   h += "<p class=hint><b>OTA</b> &mdash; ArduinoOTA: ";
   h += (MxOta.armed() ? "<b>armato</b> (push dall'IDE sulla LAN)"
-                      : "disabilitato <i>(OTA_PASSWORD vuota nel sorgente)</i>");
+                      : "disabilitato <i>(OTA_PASSWORD_SHA256 vuota nel sorgente)</i>");
   h += "<br>Pull mxota: ";
   h += (otaHttpUrl[0] ? "<b>configurato</b> (fw <b>" + String(OTA_FW_NAME) + "</b>), controllo automatico a ogni avvio"
                       : String("non configurato <i>(OTA_HTTP_BASE vuoto nel sorgente)</i>"));
   h += "<br>Finche' sono entrambi spenti, per aggiornare questo pannello serve il cavo.</p>";
   h += String("<p class=hint><a href='/'>Stato</a> &middot; ") + MxOta.linkHtml() + "</p>";
+  h += brandFoot();
   h += "</body></html>";
 
   server.send(200, "text/html", h);
@@ -1040,10 +1071,11 @@ void handleStatusPage() {
   h += "<!DOCTYPE HTML><html><head><meta charset='utf-8'>"
        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
        "<meta http-equiv='refresh' content='10'>"
-       "<title>Pannello MxIrrigation</title>"
+       "<title>Stato nodi - " + brandStr() + "</title>"
        "<style>body{font-family:Arial;font-size:14px;margin:12px}"
        "table{border-collapse:collapse}td,th{padding:6px;border-bottom:1px solid #ddd}"
        ".off{color:#b00}.on{color:#080}</style></head><body>";
+  h += "<p><b>" + brandStr() + "</b></p>";
   h += "<h2>Stato nodi</h2><table><tr><th>Nodo</th><th>Indirizzo</th><th>Stato</th></tr>";
   for (int i = 0; i < MAX_NODES; i++) {
     if (!dcfg.nodes[i].enabled) continue;
@@ -1059,7 +1091,9 @@ void handleStatusPage() {
     }
     h += "</td></tr>";
   }
-  h += "</table><p><a href='/config'>Configurazione</a></p></body></html>";
+  h += "</table><p><a href='/config'>Configurazione</a></p>";
+  h += brandFoot();
+  h += "</body></html>";
   server.send(200, "text/html", h);
 }
 
@@ -1186,8 +1220,12 @@ void setup() {
   buildOtaUrl();
 
   cfg.fwVersion       = FW_VERSION;
+  cfg.productName     = PRODUCT_NAME;
   cfg.wdtSeconds      = 15;
-  cfg.otaPassword     = OTA_PASSWORD;
+  // La libreria accende ArduinoOTA solo con una password non vuota e la passa
+  // a setPassword(): le si da l'hash per accenderlo, e subito dopo
+  // MxCore.begin() setPasswordHash() mette al suo posto l'hash vero e proprio.
+  cfg.otaPassword     = OTA_PASSWORD_SHA256;
   cfg.otaHttpUrl      = otaHttpUrl;
   cfg.factoryResetPin = 0;
   cfg.requireIdentity = false;
@@ -1195,6 +1233,7 @@ void setup() {
   // preciso per fare il suo lavoro. Se serve, si imposta dal portale.
 
   MxCore.begin(cfg);
+  ArduinoOTA.setPasswordHash(OTA_PASSWORD_SHA256);
 
   registerRoutes();
   server.begin();

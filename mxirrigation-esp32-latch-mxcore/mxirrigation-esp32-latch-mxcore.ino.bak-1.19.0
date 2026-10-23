@@ -1,0 +1,1433 @@
+/**
+ * ============================================================================
+ * Progetto:    MxIrrigation - Centralina valvole latch (H-bridge)
+ * File:        mxirrigation-esp32-latch-mxcore.ino
+ * Autore:      Nicola Deboni - MxSolutions
+ * Versione:    1.19.0
+ * Ultima mod.: 2026-09-26
+ * Repository:  vault "03 - Elettronica/Progetti/mxirrigation" -> vedi
+ *              [[esp32-latch-hbridge]] e [[mxirrigation]]
+ * ----------------------------------------------------------------------------
+ * Descrizione:
+ *   Comanda 8 elettrovalvole bistabili (latch) tramite ponti ad H: ogni
+ *   commutazione e' un impulso di 400 ms di polarita' opportuna, poi entrambi
+ *   i pin tornano bassi (a riposo nessun consumo, nessuno shoot-through).
+ *   Comando via web server HTTP sulla porta 80.
+ *
+ *   Rispetto alla 1012 cambia solo l'infrastruttura: identita', WiFi, portale,
+ *   NTP, watchdog e OTA vengono da MxSolutionCore. La logica valvole (coda
+ *   FIFO non bloccante, dedup, stato ottimistico, redirect 303) e' quella
+ *   della 1012, invariata: e' il pezzo che risolve i comandi persi.
+ *
+ * Hardware:
+ *   Scheda:      ESP32 classico, DUE modelli con cablaggi diversi. Il modello
+ *                si sceglie da /config (o da seriale con "board") e resta in
+ *                NVS: NON e' compilato. Vedi la tabella BOARDS nel codice.
+ *   Periferiche: 8 ponti ad H (2 GPIO per valvola), 8 elettrovalvole latch
+ *
+ *   Pin, per modello:
+ *
+ *                     ESP32U            ESP32-MINI-32-V1.3
+ *     Valvola      lato A  lato B       lato A  lato B
+ *        1           13      14           22      21
+ *        2           16      17           17      16
+ *        3           18      19           27      25
+ *        4           21      22           32       4
+ *        5           23      25            0 (!)   2 (!)
+ *        6           26      27           19      23
+ *        7           32      33            5      33
+ *        8            4       5           26      18
+ *     Reset fabbrica   0                  13
+ *
+ *     ON  -> A = LOW,  B = HIGH  per VALVE_PULSE_MS, poi entrambi LOW
+ *     OFF -> A = HIGH, B = LOW   per VALVE_PULSE_MS, poi entrambi LOW
+ *     A riposo entrambi LOW: nessun consumo, nessuno shoot-through.
+ *
+ *     (!) Sulla MINI-32 la valvola 5 sta su GPIO 0 e GPIO 2, che sono
+ *         entrambi pin di STRAPPING:
+ *           - GPIO 0 deve essere ALTO al reset, altrimenti l'ESP32 entra in
+ *             modalita' programmazione e non parte;
+ *           - GPIO 2 deve essere basso o flottante al boot.
+ *         Se i ponti ad H caricano quei pin al momento dell'accensione, il
+ *         device puo' non avviarsi. E' cablaggio ereditato, non una scelta:
+ *         verificare col tester a device spento cosa fanno quegli ingressi.
+ *         E' anche il motivo per cui su questa scheda il reset di fabbrica
+ *         NON puo' stare sul GPIO 0 come sull'altra: li' e' gia' occupato.
+ *
+ *     ATTENZIONE: entrambe le mappe valgono SOLO su ESP32 classico. Su
+ *     ESP32-S2 i GPIO 23, 25, 27, 32 e 33 non esistono.
+ *
+ *     ⚠️ Il reset di fabbrica cancella anche il modello di scheda e riporta
+ *     al default ESP32U. Le due mappe condividono molti GPIO in ruoli
+ *     diversi: su una MINI-32, dopo un reset, primeValvesOff() piloterebbe
+ *     ponti sbagliati. Riscegliere il modello PRIMA di rimettere in
+ *     pressione l'impianto.
+ *
+ * Arduino IDE / arduino-cli:
+ *   Board:            ESP32 Dev Module / esp32:esp32:esp32
+ *   Core version:     esp32 3.3.11
+ *   Partition Scheme: Minimal SPIFFS (min_spiffs) - con la default si sta
+ *                     sopra il 90%, troppo poco margine
+ *   Flash:            QIO 80MHz, 4MB
+ *
+ *   Librerie (nome - versione esatta testata):
+ *     MxSolutionCore  - 0.1.8   (0.1.6 per MxAuth, 0.1.8 per l'OTA che
+ *                                funziona davvero: vedi la nota in fondo)
+ *     (nient'altro: ESPping non serve piu', il ping e' stato tolto)
+ *
+ *
+ * NUMERAZIONE - cambiata il 2026-09-27, prima del primo flash di questa
+ * versione. Questo firmware contava per interi (1011 ... 1019); tutti gli
+ * altri nodi dell'impianto usano tre numeri (pompa 1.7.0, valvola a T 1.0.0,
+ * pannello 1.3.0), e mxota confronta le versioni con version_compare quando
+ * non sono entrambe numeriche. Da qui in avanti anche questo nodo usa lo
+ * stesso schema:
+ *
+ *     1017 -> 1.17.0     1018 -> 1.18.0     1019 -> 1.19.0 (questa)
+ *
+ * Le voci di changelog qui sotto NON sono state riscritte: quelle versioni
+ * sono esistite con quel numero, e sul campo gira ancora la 1016. Il "19"
+ * e' stato tenuto proprio per non rompere la corrispondenza.
+ *
+ * ⚠️ Il cambio di schema va fatto COL CAVO, e questa e' l'unica finestra in
+ * cui non costa niente. version_compare("1.19.0", "1016") confronta 1 con
+ * 1016 e conclude che la nuova e' PIU' VECCHIA: un nodo che dichiara ancora
+ * "1016" non riceverebbe MAI questo aggiornamento via mxota. Le due
+ * centraline vanno flashate col cavo comunque (token da seriale e correzione
+ * del watchdog nell'OTA), e su mxota non e' stato pubblicato ancora nessun
+ * binario: dopo il flash tutti dichiarano lo stesso schema e i confronti
+ * tornano coerenti.
+ *
+ * Note di versione:
+ *   2026-09-27      - Ricompilato su MxSolutionCore 0.1.8 (nessuna modifica a
+ *                      questo sketch). Cosa cambia sotto: l'OTA accetta la
+ *                      risposta CHUNKED, che e' quella che manda il server
+ *                      mxota reale - prima il pull si fermava su "risposta
+ *                      senza Content-Length" e nessun nodo poteva
+ *                      aggiornarsi; i timeout di connessione e di attesa
+ *                      degli header stanno sotto il timeout del watchdog
+ *                      (prima 6+15 = 21 s contro 15: un server lento a
+ *                      RISPONDERE riavviava il device); un campo vuoto nel
+ *                      captive portale non cancella piu' la password
+ *                      salvata; niente piu' "TWDT already initialized" a
+ *                      ogni avvio.
+ *   2026-09-26 1.19.0 - AUTENTICAZIONE DELLE AZIONI (MxAuth, MxSolutionCore
+ *                     0.1.6). Fino alla 1018 aprire una valvola era una GET
+ *                     senza password: bastava l'indirizzo in una barra, un
+ *                     segnalibro, un prefetch del browser o una <img src> in
+ *                     una pagina qualunque. Ora valvole, /reboot, /ota e
+ *                     /config/save vogliono POST + token nell'header
+ *                     "X-Mx-Token", e la pagina di configurazione puo' avere
+ *                     una password sua ("X-Mx-Cfg"). Tre interruttori in NVS
+ *                     ("mxauth"), modificabili da /config o da seriale col
+ *                     comando "auth": metodo (solo POST / anche GET), token
+ *                     richiesto si-no, password della pagina.
+ *                     ATTENZIONE: DOPO IL FLASH I COMANDI SONO BLOCCATI
+ *                     finche' non si imposta il token da seriale:
+ *                        auth token <valore>
+ *                     /status resta SENZA autenticazione: lo leggono il
+ *                     pannello di stato e il collettore dei dati, non cambia
+ *                     niente sul device e non espone segreti.
+ *                     I pulsanti delle pagine non sono piu' link ma fetch()
+ *                     in POST; il token sta nel localStorage del browser e
+ *                     viaggia in un header, mai nell'URL.
+ *   2026-09-20 1018 - Due correzioni misurate sul campo:
+ *                     1) /status esce in UN SOLO server.send() con il suo
+ *                        Content-Length, non piu' in ~30 sendContent() in
+ *                        chunked non controllate. Su un collegamento con
+ *                        perdita bastava una write fallita perche' il JSON
+ *                        arrivasse troncato e senza terminatore: il pannello
+ *                        lo leggeva come nodo offline. Prova del 20/09 sullo
+ *                        stesso bridge: pompa (invio singolo) 10/10, valvole
+ *                        8/10 e in un'altra serie 2/8.
+ *                     2) L'URL del pull OTA puntava a fw=mxirrigation-pump:
+ *                        il nodo valvole chiedeva il firmware DELLA POMPA e
+ *                        se lo sarebbe installato. Ora "fw" e' una costante
+ *                        a parte (mxirrigation-latch) e "id" viene preso
+ *                        dall'identita' a runtime, cosi' lo stesso sorgente
+ *                        vale per piu' centraline. Svuotata anche
+ *                        OTA_PASSWORD, che conteneva per errore l'hash
+ *                        bcrypt admin del server mxota.
+ *   2026-09-19 1017 - La MAPPA PIN non e' piu' compilata: si sceglie il modello
+ *                     di scheda da /config (o da seriale con "board") e resta in
+ *                     NVS. UN SOLO BINARIO per ESP32U e ESP32-MINI-32-V1.3,
+ *                     quindi l'OTA non puo' piu' servire il cablaggio sbagliato
+ *                     all'altra scheda. Anche il pin del reset di fabbrica segue
+ *                     il modello (0 su ESP32U, 13 su MINI-32, dove il GPIO 0 e'
+ *                     la valvola 5 lato A). /status espone "board".
+ *                     ATTENZIONE: il reset di fabbrica cancella anche il modello
+ *                     e riporta al default ESP32U. Su una MINI-32 va riscelto
+ *                     PRIMA di rimettere in pressione l'impianto.
+ *   2026-09-18 1016 - /status dichiara "type":"latch". Serve al pannello di
+ *                     stato per accorgersi se e' stato configurato col tipo
+ *                     sbagliato, invece di mostrare una pagina vuota.
+ *   2026-09-10 1015 - MxSolutionCore 0.1.4: l'IP fisso qui sotto diventa il
+ *                     DEFAULT DI FABBRICA. Chi monta il device puo' cambiarlo
+ *                     dal captive portal (o tornare in DHCP) senza
+ *                     ricompilare, e la sua scelta vince su questo valore.
+ *   2026-09-10 1014 - MxSolutionCore 0.1.3: la rotta "/ota" non e' piu' scritta
+ *                     a mano ma registrata da MxOta.attachWeb() (con l'auth di
+ *                     questo progetto), e il link nella pagina Info arriva da
+ *                     MxOta.linkHtml(). Attivo il check OTA automatico
+ *                     all'avvio (15 s dopo il boot, solo se OTA_HTTP_URL e'
+ *                     configurato).
+ *   2026-09-09 1013 - Portato su MxSolutionCore 0.1.2. Identita' in NVS "mxid"
+ *                     (niente piu' SSID/password nel sorgente: captive portal),
+ *                     watchdog sul loop, OTA (ArduinoOTA in LAN + pull da
+ *                     mxota/api.php), IP statico via MxCore. Tolto il ping di
+ *                     link-health. primeValvesOff() spostato PRIMA della rete.
+ *                     Logica valvole invariata rispetto alla 1012.
+ *   2026-09-05 1012 - Coda comandi FIFO non bloccante, redirect 303, dedup,
+ *                     stato ottimistico, DISABLE_PING. Mai flashata sul campo.
+ *   2026-07-31 1011 - Versione in esercizio: un solo impulso globale, comandi
+ *                     ravvicinati persi in silenzio.
+ * ============================================================================
+ */
+
+#include <MxCore.h>
+#include <WebServer.h>
+#include <stdarg.h>
+#include <Preferences.h>
+
+const char* FW_VERSION = "1.19.0";
+
+// =========================================================================
+// CONFIGURAZIONE
+// =========================================================================
+
+// --- rete: IP fisso di DEFAULT -------------------------------------------
+// Le credenziali WiFi NON stanno qui: si impostano dal captive portal
+// "Mx-Setup-XXXX" al primo avvio (vedi manuale di MxSolutionCore).
+// Anche questo indirizzo si puo' cambiare dal portale (o disattivare per
+// tornare in DHCP): quello impostato li' VINCE su quanto scritto qui, che
+// vale solo finche' nessuno ha configurato la rete.
+IPAddress STATIC_IP(192, 168, 5, 42);
+IPAddress GATEWAY  (192, 168, 5, 1);
+IPAddress SUBNET   (255, 255, 255, 0);
+IPAddress DNS1     (8, 8, 8, 8);
+IPAddress DNS2     (1, 1, 1, 1);
+
+// --- OTA -----------------------------------------------------------------
+// DA RIEMPIRE PRIMA DEL FLASH. Password vuota = ArduinoOTA disabilitato.
+//
+// ATTENZIONE alla password: qui va una password NORMALE, scelta da chi
+// installa. NON l'hash bcrypt di config.php del server mxota: quello e'
+// il segreto del pannello di amministrazione e non deve finire dentro il
+// binario di un device, da cui chiunque puo' rileggerlo.
+const char* OTA_PASSWORD = "mxirr-6fquf15vxeow";      // "" = ArduinoOTA disabilitato
+
+// L'URL del pull NON si scrive a mano intero: il campo "fw" sceglie QUALE
+// binario il server consegna, e sbagliarlo significa farsi installare il
+// firmware di un altro nodo. Il campo "id" serve al server solo per sapere
+// chi ha chiamato, e viene preso dall'identita' del device a runtime, cosi'
+// lo stesso sorgente puo' stare su piu' centraline senza che si confondano
+// fra loro in manage.php.
+const char* OTA_HTTP_BASE = "https://www.mxsolutions.it/mxota/api.php";                       // "" = pull disabilitato
+                                                      // es. "https://www.mxsolutions.it/mxota/api.php"
+const char* OTA_FW_NAME   = "mxirrigation-latch";     // <-- NON "mxirrigation-pump"
+const char* OTA_TOKEN     = "wmp-2026a-123";                       // token condiviso col server
+
+// Composto in setup(): base + fw + id + token. MxOta rifiuta un URL oltre i
+// 224 caratteri, quindi qui si controlla e si avvisa invece di troncare.
+char otaHttpUrl[224] = "";
+
+
+// --- auth delle pagine web ----------------------------------------------
+#define AUTH_ENABLED 0
+const char* URL_PASSWORD = "change-me";
+
+// --- recovery ------------------------------------------------------------
+#define ENABLE_AUTO_RESTART_ON_LOW_HEAP 1
+const uint32_t LOW_HEAP_THRESHOLD = 12000;
+const uint32_t LOW_HEAP_GRACE_MS  = 60000;
+
+// --- timing --------------------------------------------------------------
+#define VALVE_PULSE_MS 400
+
+// --- debug ---------------------------------------------------------------
+#define SERIAL_VALVE_DEBUG 1
+
+// --- reset di fabbrica ---------------------------------------------------
+// Il pin NON e' piu' fisso: dipende dal modello di scheda (vedi BOARDS piu'
+// sotto), perche' sull'ESP32-MINI-32 il GPIO 0 e' la valvola 5 lato A.
+//   ESP32U  -> GPIO 0  (tasto BOOT, libero su quella scheda)
+//   MINI-32 -> GPIO 13
+// Cancella "mxnet" (rete, IP E modello di scheda). "mxid" non si tocca.
+
+// =========================================================================
+// VALVOLE
+// =========================================================================
+
+const int COMMAND_LOG_SIZE = 4;
+const int VALVE_COUNT      = 8;
+
+// =========================================================================
+// MODELLO DI SCHEDA E MAPPA PIN  (scelti da /config, non ricompilando)
+// =========================================================================
+//
+// Le due schede in uso hanno cablaggi DIVERSI e incompatibili. Tenere la
+// mappa in un #define significherebbe due binari distinti, e quindi due nomi
+// di firmware diversi su mxota: il check automatico all'avvio scaricherebbe
+// prima o poi il binario sbagliato su una delle due, con conseguenze gravi
+// (reset di fabbrica a ogni boot, valvole su ponti sbagliati) e recuperabili
+// solo via USB.
+//
+// Qui il modello sta in NVS: UN SOLO BINARIO per entrambe le schede, e ogni
+// device conosce il proprio cablaggio. L'OTA non puo' piu' scambiarle.
+//
+// NOTA: la chiave sta nel namespace "mxnet" della libreria, non in uno
+// proprio. E' deliberato: cosi' il reset di fabbrica (che fa clear() su
+// quel namespace) la cancella insieme alla rete, come richiesto.
+
+enum BoardModel { BOARD_ESP32U = 0, BOARD_MINI32 = 1 };
+
+struct BoardDef {
+  const char* id;                 // come compare in /status e da seriale
+  const char* label;              // come compare a video
+  int valveA[VALVE_COUNT];
+  int valveB[VALVE_COUNT];
+  int factoryResetPin;
+};
+
+static const BoardDef BOARDS[] = {
+  { "esp32u", "ESP32U",
+    {13, 16, 18, 21, 23, 26, 32, 4},
+    {14, 17, 19, 22, 25, 27, 33, 5},
+    0 },                                  // BOOT libero su questa scheda
+  { "mini32", "ESP32-MINI-32-V1.3",
+    {22, 17, 27, 32,  0, 19,  5, 26},
+    {21, 16, 25,  4,  2, 23, 33, 18},
+    13 },                                 // GPIO0 e' la valvola 5: reset su 13
+};
+static const int BOARD_COUNT = sizeof(BOARDS) / sizeof(BOARDS[0]);
+
+// Default a NVS vuota: ESP32U, la mappa storica di questo firmware.
+static const uint8_t BOARD_DEFAULT = BOARD_ESP32U;
+
+uint8_t boardModel = BOARD_DEFAULT;
+int valveA[VALVE_COUNT];
+int valveB[VALVE_COUNT];
+int factoryResetPin = 0;
+
+
+bool valveStatus[VALVE_COUNT] = {false, false, false, false, false, false, false, false};
+
+// Impulso attualmente in corso sul "bus" dei ponti ad H: ne puo' esistere
+// UNO solo alla volta (limite hardware/alimentazione).
+struct ValvePulse {
+  bool active;
+  int idx;
+  bool targetOn;
+  unsigned long startMs;
+};
+
+// Coda comandi valvole (buffer circolare FIFO). Ogni richiesta HTTP on/off
+// inserisce qui un ValveCommand e ritorna subito; serviceValveQueue()
+// estrae ed esegue un comando alla volta.
+const int VALVE_QUEUE_SIZE = 16;
+
+struct ValveCommand {
+  int idx;        // indice valvola 0..VALVE_COUNT-1
+  bool targetOn;  // stato desiderato
+};
+
+struct ValveQueue {
+  ValveCommand items[VALVE_QUEUE_SIZE];
+  int head;   // prossimo elemento da estrarre
+  int tail;   // prossima posizione libera
+  int count;  // elementi presenti
+};
+
+enum QueuePushResult {
+  QP_FULL   = 0,  // coda piena, comando scartato
+  QP_PUSHED = 1,  // comando inserito
+  QP_DEDUP  = 2   // comando identico gia' in coda, ignorato
+};
+
+struct CommandLogEntry {
+  bool valid;
+  char timestamp[20];
+  char action[4];
+  uint8_t valveNumber;
+};
+
+// Queste tre funzioni stanno QUI, dopo TUTTI i tipi, e non accanto alla
+// tabella BOARDS: l'IDE Arduino inserisce i prototipi automatici davanti
+// alla prima funzione del file, e se fosse applyBoard() finirebbero prima
+// di ValveCommand/QueuePushResult, che non compilerebbero piu'.
+void applyBoard(uint8_t m) {
+  if (m >= BOARD_COUNT) m = BOARD_DEFAULT;
+  boardModel = m;
+  for (int i = 0; i < VALVE_COUNT; i++) {
+    valveA[i] = BOARDS[m].valveA[i];
+    valveB[i] = BOARDS[m].valveB[i];
+  }
+  factoryResetPin = BOARDS[m].factoryResetPin;
+}
+
+// Da chiamare PRIMA di qualunque pinMode e prima di MxCore.begin().
+void loadBoard() {
+  Preferences p;
+  p.begin("mxnet", true);
+  uint8_t m = p.getUChar("board", BOARD_DEFAULT);
+  p.end();
+  applyBoard(m);
+}
+
+void saveBoard(uint8_t m) {
+  Preferences p;
+  p.begin("mxnet", false);
+  p.putUChar("board", m);
+  p.end();
+}
+
+ValvePulse     currentPulse = {false, -1, false, 0};
+ValveQueue     valveQueue   = {{}, 0, 0, 0};
+CommandLogEntry commandLog[COMMAND_LOG_SIZE];
+
+WebServer server(80);
+
+MxCoreConfig cfg;
+
+time_t bootEpoch = 0;
+bool   bootTimeCaptured = false;
+unsigned long lowHeapSinceMs = 0;
+
+// =========================================================================
+// ORA  (i formati restano quelli della 1012; la validita' la decide MxTime)
+// =========================================================================
+
+void formatDateTimeNow(char* out, size_t outSize) {
+  if (!MxTime.valid()) { snprintf(out, outSize, "Time not available"); return; }
+  MxTime.local(out, outSize, "%d/%m/%Y %H:%M:%S");
+}
+
+void formatDateNow(char* out, size_t outSize) {
+  if (!MxTime.valid()) { snprintf(out, outSize, "--/--/----"); return; }
+  MxTime.local(out, outSize, "%d/%m/%Y");
+}
+
+void formatTimeNow(char* out, size_t outSize) {
+  if (!MxTime.valid()) { snprintf(out, outSize, "--:--:--"); return; }
+  MxTime.local(out, outSize, "%H:%M:%S");
+}
+
+void formatEpochDateTime(time_t epoch, char* out, size_t outSize) {
+  if (epoch <= 0) { snprintf(out, outSize, "Not available"); return; }
+  struct tm timeinfo;
+  localtime_r(&epoch, &timeinfo);
+  strftime(out, outSize, "%d/%m/%Y %H:%M:%S", &timeinfo);
+}
+
+// L'ora di boot si puo' fissare solo dopo il primo sync NTP.
+void captureBootEpochIfNeeded() {
+  if (bootTimeCaptured || !MxTime.valid()) return;
+  bootEpoch = MxTime.epoch() - (time_t)MxCore.uptimeS();
+  bootTimeCaptured = true;
+  char buf[32];
+  formatEpochDateTime(bootEpoch, buf, sizeof(buf));
+  Serial.printf("[TIME] boot stimato: %s\n", buf);
+}
+
+void addCommandLog(uint8_t valveNumber, const char* action) {
+  for (int i = COMMAND_LOG_SIZE - 1; i > 0; i--) commandLog[i] = commandLog[i - 1];
+  commandLog[0].valid = true;
+  formatDateTimeNow(commandLog[0].timestamp, sizeof(commandLog[0].timestamp));
+  snprintf(commandLog[0].action, sizeof(commandLog[0].action), "%s", action);
+  commandLog[0].valveNumber = valveNumber;
+}
+
+// =========================================================================
+// AUTH LEGACY DELLE PAGINE  (?pass=..., invariata dalla 1012)
+// =========================================================================
+//
+// Questa protegge solo la LETTURA delle pagine, ed e' disattivata
+// (AUTH_ENABLED 0). Le AZIONI - valvole, reboot, ota, salvataggio della
+// configurazione - non passano piu' da qui: le controlla MxAuth (POST +
+// token in header). Le due cose sono separate di proposito: una pagina che
+// si legge e un comando che apre l'acqua non hanno lo stesso peso.
+
+String getAuthQuery() {
+#if AUTH_ENABLED
+  return String("?pass=") + URL_PASSWORD;
+#else
+  return "";
+#endif
+}
+
+bool isAuthorized() {
+#if AUTH_ENABLED
+  if (!server.hasArg("pass")) return false;
+  return server.arg("pass") == URL_PASSWORD;
+#else
+  return true;
+#endif
+}
+
+bool ensureAuthorized() {
+  if (isAuthorized()) return true;
+  server.send(401, "text/plain", "Unauthorized. Use ?pass=YOUR_PASSWORD in URL");
+  return false;
+}
+
+void sendChunk(const char* s) { server.sendContent(s); }
+
+void sendFmt(const char* fmt, ...) {
+  char buf[384];
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, args);
+  va_end(args);
+  server.sendContent(buf);
+}
+
+// =========================================================================
+// CODA COMANDI VALVOLE  (logica invariata dalla 1012)
+// =========================================================================
+
+#if SERIAL_VALVE_DEBUG
+void logValvePinsState(const char* phase, int idx) {
+  if (idx < 0 || idx >= VALVE_COUNT) return;
+  Serial.printf("[VALVE %d] %s | A pin=%d state=%s | B pin=%d state=%s\n",
+                idx + 1, phase,
+                valveA[idx], digitalRead(valveA[idx]) ? "HIGH" : "LOW",
+                valveB[idx], digitalRead(valveB[idx]) ? "HIGH" : "LOW");
+}
+#endif
+
+// Inserisce un comando in coda. Ritorna QP_PUSHED / QP_DEDUP / QP_FULL.
+QueuePushResult valveQueuePush(int idx, bool targetOn) {
+  if (valveQueue.count >= VALVE_QUEUE_SIZE) return QP_FULL;
+
+  // Dedup: guarda l'ultimo comando gia' in coda per questa valvola.
+  for (int k = valveQueue.count - 1; k >= 0; k--) {
+    int pos = (valveQueue.head + k) % VALVE_QUEUE_SIZE;
+    if (valveQueue.items[pos].idx == idx) {
+      if (valveQueue.items[pos].targetOn == targetOn) return QP_DEDUP;
+      break;   // ultimo comando e' opposto: accoda comunque
+    }
+  }
+
+  valveQueue.items[valveQueue.tail] = { idx, targetOn };
+  valveQueue.tail = (valveQueue.tail + 1) % VALVE_QUEUE_SIZE;
+  valveQueue.count++;
+  return QP_PUSHED;
+}
+
+bool valveQueuePop(ValveCommand* out) {
+  if (valveQueue.count == 0) return false;
+  *out = valveQueue.items[valveQueue.head];
+  valveQueue.head = (valveQueue.head + 1) % VALVE_QUEUE_SIZE;
+  valveQueue.count--;
+  return true;
+}
+
+int valvePendingCount() {
+  return valveQueue.count + (currentPulse.active ? 1 : 0);
+}
+
+// Accoda un comando on/off. Non bloccante: ritorna subito.
+// Aggiorna stato "ottimistico" e log gia' all'accodamento.
+bool enqueueValveCommand(int idx, bool turnOn) {
+  if (idx < 0 || idx >= VALVE_COUNT) return false;
+
+  QueuePushResult r = valveQueuePush(idx, turnOn);
+  if (r == QP_FULL) {
+    Serial.printf("[QUEUE] piena (%d), comando V%d %s SCARTATO\n",
+                  valveQueue.count, idx + 1, turnOn ? "ON" : "OFF");
+    return false;
+  }
+
+  valveStatus[idx] = turnOn;   // stato ottimistico: la UI mostra subito il voluto
+
+  if (r == QP_PUSHED) {
+    addCommandLog(idx + 1, turnOn ? "ON" : "OFF");
+    Serial.printf("[QUEUE] accodato V%d %s (in coda: %d)\n",
+                  idx + 1, turnOn ? "ON" : "OFF", valveQueue.count);
+  } else {
+    Serial.printf("[QUEUE] V%d %s gia' in coda, ignorato\n",
+                  idx + 1, turnOn ? "ON" : "OFF");
+  }
+  return true;
+}
+
+void stopPulse(int idx) {
+  if (idx < 0 || idx >= VALVE_COUNT) return;
+  digitalWrite(valveA[idx], LOW);
+  digitalWrite(valveB[idx], LOW);
+}
+
+// Avvia fisicamente l'impulso. Chiamata SOLO da serviceValveQueue().
+void startValvePulse(int idx, bool turnOn) {
+  if (idx < 0 || idx >= VALVE_COUNT) return;
+  if (currentPulse.active) return;   // sicurezza: bus gia' occupato
+
+#if SERIAL_VALVE_DEBUG
+  Serial.printf("[VALVE %d] START %s\n", idx + 1, turnOn ? "ON" : "OFF");
+  logValvePinsState("BEFORE", idx);
+#endif
+
+  if (turnOn) {
+    digitalWrite(valveA[idx], LOW);
+    digitalWrite(valveB[idx], HIGH);
+  } else {
+    digitalWrite(valveA[idx], HIGH);
+    digitalWrite(valveB[idx], LOW);
+  }
+
+#if SERIAL_VALVE_DEBUG
+  logValvePinsState("ACTIVE", idx);
+#endif
+
+  currentPulse.active  = true;
+  currentPulse.idx     = idx;
+  currentPulse.targetOn = turnOn;
+  currentPulse.startMs = millis();
+
+  Serial.printf("[VALVE] %d impulso avviato -> %s\n", idx + 1, turnOn ? "ON" : "OFF");
+}
+
+// Motore non bloccante della coda: da chiamare a ogni giro di loop().
+//  - se c'e' un impulso in corso, lo chiude appena scaduto VALVE_PULSE_MS;
+//  - se il bus e' libero, avvia il comando successivo in coda.
+void serviceValveQueue() {
+  if (currentPulse.active) {
+    if (millis() - currentPulse.startMs >= (unsigned long)VALVE_PULSE_MS) {
+      stopPulse(currentPulse.idx);
+#if SERIAL_VALVE_DEBUG
+      logValvePinsState("PULSE END", currentPulse.idx);
+#endif
+      Serial.printf("[VALVE] %d impulso completato\n", currentPulse.idx + 1);
+      currentPulse.active   = false;
+      currentPulse.idx      = -1;
+      currentPulse.targetOn = false;
+      currentPulse.startMs  = 0;
+    }
+    return;   // bus occupato: non avviare altro in questo giro
+  }
+
+  ValveCommand cmd;
+  if (valveQueuePop(&cmd)) startValvePulse(cmd.idx, cmd.targetOn);
+}
+
+// Porta tutte le valvole in OFF noto all'avvio. Bloccante (8 x 400 ms), ma
+// gira PRIMA della rete: le valvole devono essere in uno stato certo anche
+// se poi il portale resta aperto minuti.
+void primeValvesOff() {
+  for (int i = 0; i < VALVE_COUNT; i++) {
+    pinMode(valveA[i], OUTPUT);
+    pinMode(valveB[i], OUTPUT);
+
+#if SERIAL_VALVE_DEBUG
+    Serial.printf("[VALVE %d] STARTUP RESET\n", i + 1);
+    logValvePinsState("INIT BEFORE", i);
+#endif
+
+    digitalWrite(valveA[i], HIGH);
+    digitalWrite(valveB[i], LOW);
+
+#if SERIAL_VALVE_DEBUG
+    logValvePinsState("INIT ACTIVE", i);
+#endif
+
+    delay(VALVE_PULSE_MS);
+    stopPulse(i);
+
+#if SERIAL_VALVE_DEBUG
+    logValvePinsState("INIT END", i);
+#endif
+
+    valveStatus[i] = false;
+  }
+}
+
+// =========================================================================
+// PAGINE WEB
+// =========================================================================
+
+void getWiFiSignalText(char* out, size_t outSize) {
+  if (!MxNet.connected()) { snprintf(out, outSize, "Disconnected"); return; }
+  long rssi = MxNet.rssi();
+  if      (rssi >= -50) snprintf(out, outSize, "%ld dBm (Excellent)", rssi);
+  else if (rssi >= -60) snprintf(out, outSize, "%ld dBm (Good)", rssi);
+  else if (rssi >= -70) snprintf(out, outSize, "%ld dBm (Fair)", rssi);
+  else                  snprintf(out, outSize, "%ld dBm (Weak)", rssi);
+}
+
+void startHtml(const char* title) {
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "text/html", "");
+  sendChunk("<!DOCTYPE html><html><head>");
+  sendChunk("<meta charset='utf-8'>");
+  sendChunk("<meta name='viewport' content='width=device-width, initial-scale=1'>");
+  sendChunk("<meta http-equiv='Cache-Control' content='no-cache, no-store, must-revalidate'>");
+  sendChunk("<meta http-equiv='Pragma' content='no-cache'>");
+  sendChunk("<meta http-equiv='Expires' content='0'>");
+
+  // Il token sta nel localStorage del BROWSER e viaggia in un header, mai
+  // nell'URL: cosi' non finisce nella cronologia, nei log ne' nel Referer.
+  // Nessuna sessione lato ESP32, nessun cookie, nessuno stato da tenere su
+  // un dispositivo che ha poca memoria.
+  sendChunk("<script>"
+            "function mxTok(f){var t=localStorage.getItem('mxtoken')||'';"
+            "if(!t||f){t=prompt('Token del nodo:',t)||'';"
+            "if(t)localStorage.setItem('mxtoken',t);}return t;}"
+            "function mxCfg(f){var t=localStorage.getItem('mxcfgpw')||'';"
+            "if(!t||f){t=prompt('Password della pagina di configurazione:',t)||'';"
+            "if(t)localStorage.setItem('mxcfgpw',t);}return t;}"
+            "async function mxPost(p,body){"
+            "var r=await fetch(p,{method:'POST',headers:{'X-Mx-Token':mxTok(false),"
+            "'X-Mx-Cfg':localStorage.getItem('mxcfgpw')||'',"
+            "'Content-Type':'application/x-www-form-urlencoded'},body:body||''});"
+            "if(r.status===401){var j=await r.json().catch(function(){return {};});"
+            "alert('Non autorizzato'+(j.hint?': '+j.hint:'.'));mxTok(true);return null;}"
+            "if(!r.ok){alert('Errore '+r.status);return null;}return r;}"
+            "async function mxCmd(p){var r=await mxPost(p);"
+            "if(r)setTimeout(function(){location.reload();},600);}"
+            "</script>");
+  sendChunk("<title>");
+  sendChunk(title);
+  sendChunk("</title>");
+  sendChunk("</head><body style='font-family:Arial,sans-serif;font-size:14px;'>");
+}
+
+void endHtml() { sendChunk("</body></html>"); }
+
+void sendNavCompact() {
+  String q = getAuthQuery();
+  sendFmt("<p><a href='/%s'>Home</a> | <a href='/info%s'>Info</a> | "
+          "<a href='/config%s'>Config</a> | <a href='/logs%s'>Logs</a> | "
+          "<a href='/status%s'>JSON</a></p>",
+          q.c_str(), q.c_str(), q.c_str(), q.c_str(), q.c_str());
+}
+
+// Risposta di un comando accettato. Non piu' un redirect 303 verso la home:
+// i pulsanti ora fanno fetch() e ricaricano da soli, e un client come lo
+// scheduler vuole una risposta che si possa LEGGERE, non una pagina.
+//
+// Dice "accodato" e non "fatto": il comando e' entrato nella coda FIFO,
+// l'impulso di 400 ms parte nei millisecondi successivi. Lo stato vero si
+// legge da /status.
+void sendActionOk(int idx, bool on) {
+  String b = "{\"ok\":true,\"action\":\"";
+  b += on ? "on" : "off";
+  b += "\",\"valve\":" + String(idx + 1);
+  b += ",\"queued\":" + String(valveQueue.count);
+  b += ",\"busy\":"   + String(currentPulse.active ? "true" : "false");
+  b += "}";
+  server.send(200, "application/json", b);
+}
+
+void sendHomePage() {
+  char dateBuf[16], timeBuf[16];
+  formatDateNow(dateBuf, sizeof(dateBuf));
+  formatTimeNow(timeBuf, sizeof(timeBuf));
+
+  startHtml("MxIrrigation");
+  sendFmt("<h3>MxIrrigation Valvole &mdash; %s</h3>",
+          MxIdentity.provisioned() ? MxIdentity.device() : "device non provisionato");
+  sendNavCompact();
+  sendFmt("<p>%s %s</p>", dateBuf, timeBuf);
+
+  if (!MxIdentity.provisioned()) {
+    sendChunk("<p style='color:#b00'><b>Identita' non impostata</b>: "
+              "usa il comando seriale <code>id set \"Nome Pista\" \"nome-device\"</code>.</p>");
+  }
+  if (MxOta.inProgress()) {
+    sendChunk("<p style='color:#b60'><b>Aggiornamento OTA in corso</b></p>");
+  }
+
+  int pending = valvePendingCount();
+  if (pending > 0) sendFmt("<p><i>Comandi in elaborazione: %d</i></p>", pending);
+
+  // Lo stato dell'autenticazione va detto in chiaro sulla home: un nodo
+  // appena flashato che rifiuta tutto, e un nodo aperto a chiunque, sono
+  // due situazioni che chi guarda la pagina deve vedere subito.
+  if (MxAuth.misconfigured()) {
+    sendChunk("<p style='color:#b00'><b>Comandi bloccati.</b> Il token e' richiesto "
+              "ma non e' impostato. Da seriale: <code>auth token &lt;valore&gt;</code>, "
+              "oppure togli il token da <a href='/config'>/config</a>.</p>");
+  } else if (!MxAuth.requireToken()) {
+    sendChunk("<p style='color:#b60'><b>Nessun token richiesto:</b> chiunque sulla rete "
+              "locale puo' aprire e chiudere le valvole.</p>");
+  }
+
+  sendChunk("<ul>");
+  for (int i = 0; i < VALVE_COUNT; i++) {
+    sendFmt("<li>V%d [%s] "
+            "<button onclick=\"mxCmd('/%d/on')\">ON</button> "
+            "<button onclick=\"mxCmd('/%d/off')\">OFF</button></li>",
+            i + 1, valveStatus[i] ? "ON" : "OFF", i + 1, i + 1);
+  }
+  sendChunk("</ul>");
+  sendChunk("<p style='color:#555;font-size:12px'>I comandi partono in POST col token "
+            "del browser. La pagina si ricarica da sola dopo mezzo secondo, il tempo "
+            "dell'impulso.</p>");
+  endHtml();
+}
+
+void sendInfoPage() {
+  char dateBuf[16], timeBuf[16], bootBuf[32], wifiBuf[40];
+  formatDateNow(dateBuf, sizeof(dateBuf));
+  formatTimeNow(timeBuf, sizeof(timeBuf));
+  formatEpochDateTime(bootEpoch, bootBuf, sizeof(bootBuf));
+  getWiFiSignalText(wifiBuf, sizeof(wifiBuf));
+
+  unsigned long s = MxCore.uptimeS();
+  unsigned long months = s / (30UL * 24UL * 3600UL); s %= (30UL * 24UL * 3600UL);
+  unsigned long days   = s / (24UL * 3600UL);        s %= (24UL * 3600UL);
+  unsigned long hours  = s / 3600UL;                 s %= 3600UL;
+  unsigned long mins   = s / 60UL;                   s %= 60UL;
+
+  startHtml("MxIrrigation - Info");
+  sendChunk("<h3>System Info</h3>");
+  sendNavCompact();
+  sendChunk("<pre>");
+  sendFmt("Firmware        : %s\n", FW_VERSION);
+  sendFmt("MxSolutionCore  : %s\n", MXCORE_VERSION);
+  sendFmt("Scheda          : %s (reset di fabbrica GPIO %d)\n",
+          BOARDS[boardModel].label, factoryResetPin);
+  sendFmt("Pista (site)    : %s\n", MxIdentity.provisioned() ? MxIdentity.site() : "(non impostata)");
+  sendFmt("Device          : %s\n", MxIdentity.provisioned() ? MxIdentity.device() : "(non impostato)");
+  sendFmt("Device ID       : %s\n", MxIdentity.provisioned() ? MxIdentity.deviceId() : "-");
+  sendFmt("IP              : %s (%s)\n", MxNet.ip().c_str(),
+          MxNet.usingStaticIP() ? "fisso" : "DHCP");
+  sendFmt("WiFi connected  : %s\n", MxNet.connected() ? "YES" : "NO");
+  sendFmt("Signal          : %s\n", wifiBuf);
+  sendFmt("Date            : %s\n", dateBuf);
+  sendFmt("Time            : %s\n", timeBuf);
+  sendFmt("NTP sync        : %s\n", MxTime.valid() ? "YES" : "NO");
+  sendFmt("NTP last sync   : %lu s fa\n", (unsigned long)MxTime.lastSyncAgeS());
+  sendFmt("Boot time       : %s\n", bootBuf);
+  sendFmt("Timezone        : %s\n", cfg.tz);
+  sendFmt("ArduinoOTA      : %s\n", MxOta.armed() ? "armato" : "disabilitato");
+  sendFmt("OTA pull        : %s\n", otaHttpUrl[0] ? "configurato" : "non configurato");
+  if (otaHttpUrl[0]) sendFmt("OTA firmware    : %s\n", OTA_FW_NAME);
+  sendFmt("Watchdog        : %lu s\n", (unsigned long)MxWatchdog.timeoutS());
+  sendFmt("Azioni          : %s\n",
+          MxAuth.allowGet() ? "POST e GET (compatibilita')" : "solo POST");
+  sendFmt("Token           : %s\n",
+          !MxAuth.requireToken() ? "NON richiesto - chiunque sulla LAN comanda"
+                                 : (MxAuth.tokenSet()
+                                      ? "richiesto, impostato"
+                                      : "RICHIESTO MA NON IMPOSTATO - azioni bloccate"));
+  sendFmt("Pagina config   : %s\n", MxAuth.configPwSet() ? "protetta da password" : "aperta");
+  sendFmt("Valve pulse     : %d ms\n", VALVE_PULSE_MS);
+  sendFmt("Valve queue     : %d in coda%s\n",
+          valveQueue.count, currentPulse.active ? " (+1 in corso)" : "");
+  sendFmt("Free heap       : %u\n", (unsigned)ESP.getFreeHeap());
+  sendFmt("Min free heap   : %u\n", (unsigned)ESP.getMinFreeHeap());
+  sendFmt("Uptime          : %lu months, %lu days, %lu hours, %lu minutes, %lu seconds\n",
+          months, days, hours, mins, s);
+  sendChunk("</pre>");
+
+  // Non si usa piu' MxOta.linkHtml(): quello e' un <a href> in GET, e la
+  // rotta GET della libreria adesso risponde 405 in modalita' solo-POST.
+  // L'aggiornamento e il riavvio sono azioni, e passano da mxCmd().
+  sendChunk("<p><button onclick=\"if(confirm('Cercare un aggiornamento adesso? "
+            "Se ce n\\'e uno, il device si riavvia.'))mxCmd('/ota')\">"
+            "Cerca aggiornamenti</button></p>");
+  sendChunk("<p><button onclick=\"if(confirm('Riavviare la centralina? Le valvole "
+            "restano come sono: sono bistabili.'))mxCmd('/reboot')\">"
+            "REBOOT DEVICE</button></p>");
+  endHtml();
+}
+
+void sendLogsPage() {
+  startHtml("MxIrrigation - Logs");
+  sendChunk("<h3>Last 4 Commands</h3>");
+  sendNavCompact();
+  sendChunk("<ul>");
+
+  bool hasLogs = false;
+  for (int i = 0; i < COMMAND_LOG_SIZE; i++) {
+    if (!commandLog[i].valid) continue;
+    hasLogs = true;
+    sendFmt("<li>%s - Valve %u -> %s</li>",
+            commandLog[i].timestamp, commandLog[i].valveNumber, commandLog[i].action);
+  }
+  if (!hasLogs) sendChunk("<li>No commands yet</li>");
+
+  sendChunk("</ul>");
+  endHtml();
+}
+
+// Le chiavi della 1012 restano tutte (status-display e mxscheduler le leggono);
+// quelle nuove sono aggiunte in coda.
+// /status in UN SOLO invio.
+//
+// Fino alla 1017 questo JSON usciva in chunked con una trentina di
+// server.sendContent() separate, una per campo. Ognuna e' una write sul
+// socket e NESSUNA veniva controllata: su un collegamento con perdita bastava
+// che una fallisse perche' il resto sparisse in silenzio, lasciando un JSON
+// troncato — e senza chunk terminatore, cosi' il client restava ad aspettare
+// fino al proprio timeout. Il pannello di stato lo leggeva come "nodo
+// offline".
+//
+// Misurato il 20/09/2026: sullo stesso bridge .14, con la rete peggiore, la
+// pompa (che usa un solo server.send) rispondeva 10/10; queste valvole 8/10,
+// e in un'altra serie 2/8.
+//
+// Con un solo server.send() la risposta ha il suo Content-Length e parte
+// intera o non parte: o il client la riceve tutta, o vede un errore onesto.
+void sendStatusJson() {
+  String b;
+  b.reserve(1024);         // il corpo pieno sta sotto gli 850 byte
+
+  char nowBuf[32], bootBuf[32];
+  formatDateTimeNow(nowBuf, sizeof(nowBuf));
+  formatEpochDateTime(bootEpoch, bootBuf, sizeof(bootBuf));
+
+  b += "{";
+  // "type" identifica il nodo a chi lo legge (pannello di stato): le chiavi
+  // comuni sono uguali fra i nodi, il tipo dice come interpretare le altre.
+  b += "\"type\":\"latch\",";
+  b += "\"firmware\":\"" + String(FW_VERSION) + "\",";
+  b += "\"ip\":\"" + MxNet.ip() + "\",";
+  b += "\"wifi_connected\":" + String(MxNet.connected() ? "true" : "false") + ",";
+  b += "\"wifi_rssi\":" + String((long)MxNet.rssi()) + ",";
+  b += "\"ping_enabled\":false,";
+  b += "\"monitor_online\":" + String(MxNet.connected() ? "true" : "false") + ",";
+  b += "\"time_synced\":" + String(MxTime.valid() ? "true" : "false") + ",";
+  b += "\"datetime\":\"" + String(nowBuf) + "\",";
+  b += "\"boot_datetime\":\"" + String(bootBuf) + "\",";
+  b += "\"timezone\":\"" + String(cfg.tz) + "\",";
+  b += "\"valve_pulse_ms\":" + String(VALVE_PULSE_MS) + ",";
+  b += "\"valve_queue\":" + String(valveQueue.count) + ",";
+  b += "\"valve_busy\":" + String(currentPulse.active ? "true" : "false") + ",";
+  b += "\"core\":\"" + String(MXCORE_VERSION) + "\",";
+  b += "\"board\":\"" + String(BOARDS[boardModel].id) + "\",";
+  b += "\"device_id\":\"" + String(MxIdentity.provisioned() ? MxIdentity.deviceId() : "") + "\",";
+  b += "\"site\":\"" + String(MxIdentity.site()) + "\",";
+  b += "\"uptime_s\":" + String((unsigned long)MxCore.uptimeS()) + ",";
+  b += "\"heap\":" + String((unsigned)ESP.getFreeHeap()) + ",";
+  b += "\"ntp_age_s\":" + String((unsigned long)MxTime.lastSyncAgeS()) + ",";
+  b += "\"ota\":" + String(MxOta.inProgress() ? "true" : "false") + ",";
+
+  // Come e' configurata l'autenticazione - non i segreti. Serve al pannello
+  // e al futuro scheduler per accorgersi, e segnalare, che un nodo e'
+  // rimasto aperto a tutti o e' bloccato perche' manca il token.
+  b += MxAuth.statusJson() + ",";
+
+  b += "\"valves\":[";
+  for (int i = 0; i < VALVE_COUNT; i++) {
+    b += "{\"id\":" + String(i + 1) + ",\"on\":" + String(valveStatus[i] ? "true" : "false") + "}";
+    if (i < VALVE_COUNT - 1) b += ",";
+  }
+  b += "],";
+
+  b += "\"last_commands\":[";
+  bool first = true;
+  for (int i = 0; i < COMMAND_LOG_SIZE; i++) {
+    if (!commandLog[i].valid) continue;
+    if (!first) b += ",";
+    first = false;
+    b += "{\"timestamp\":\"" + String(commandLog[i].timestamp)
+       + "\",\"valve\":" + String(commandLog[i].valveNumber)
+       + ",\"action\":\"" + String(commandLog[i].action) + "\"}";
+  }
+  b += "]}";
+
+  server.send(200, "application/json", b);
+}
+
+// =========================================================================
+// ROUTE
+// =========================================================================
+
+// L'autenticazione e' fatta dalla rotta (MxAuth.checkAction): qui si arriva
+// solo a comando autorizzato. Il controllo NON si ripete dentro l'handler,
+// perche' due posti dove scrivere la stessa regola sono due posti dove
+// dimenticarsene uno - in questo progetto e' gia' successo.
+void handleValveOn(int idx) {
+  if (idx < 0 || idx >= VALVE_COUNT) {
+    server.send(404, "application/json", "{\"ok\":false,\"error\":\"invalid_valve\"}");
+    return;
+  }
+  enqueueValveCommand(idx, true);
+  sendActionOk(idx, true);
+}
+
+void handleValveOff(int idx) {
+  if (idx < 0 || idx >= VALVE_COUNT) {
+    server.send(404, "application/json", "{\"ok\":false,\"error\":\"invalid_valve\"}");
+    return;
+  }
+  enqueueValveCommand(idx, false);
+  sendActionOk(idx, false);
+}
+
+// =========================================================================
+// PAGINA DI CONFIGURAZIONE DELLA SCHEDA
+// =========================================================================
+
+void sendConfigPage() {
+  startHtml("MxIrrigation - Configurazione");
+  sendChunk("<h3>Configurazione</h3>");
+  sendNavCompact();
+
+  if (server.hasArg("saved")) {
+    sendChunk("<p style='color:green'><b>Salvato.</b> Il device si e' riavviato "
+              "con la nuova mappa pin.</p>");
+  }
+
+  sendFmt("<p>Scheda attuale: <b>%s</b></p>", BOARDS[boardModel].label);
+
+  // Il form non NAVIGA piu': si salva con fetch() in POST, perche' il token e
+  // la password della pagina viaggiano in header e un submit normale non puo'
+  // metterli.
+  sendChunk("<form id='cfgform' onsubmit='return mxSaveCfg(event)'>");
+  sendChunk("<p>");
+  for (int b = 0; b < BOARD_COUNT; b++) {
+    sendFmt("<label><input type=radio name=board value='%d'%s> %s</label><br>",
+            b, (b == boardModel) ? " checked" : "", BOARDS[b].label);
+  }
+  sendChunk("</p>");
+
+  // --- sicurezza --------------------------------------------------------
+  sendChunk("<h4>Sicurezza</h4>");
+  sendChunk("<table border=0 cellpadding=4 style='margin:0 auto;text-align:left'>");
+  sendFmt("<tr><td>Metodo delle azioni</td><td>"
+          "<label><input type=radio name='authget' value='0'%s> solo POST</label><br>"
+          "<label><input type=radio name='authget' value='1'%s> POST e GET</label>"
+          "</td></tr>",
+          MxAuth.allowGet() ? "" : " checked",
+          MxAuth.allowGet() ? " checked" : "");
+  sendFmt("<tr><td>Token richiesto</td>"
+          "<td><input type=checkbox name='authreq' value='1'%s></td></tr>",
+          MxAuth.requireToken() ? " checked" : "");
+  sendFmt("<tr><td>Token</td>"
+          "<td><input type=text name='authtok' placeholder='%s' size=30></td></tr>",
+          MxAuth.tokenSet() ? "impostato - scrivi per cambiarlo" : "NON impostato");
+  sendFmt("<tr><td>Password di questa pagina</td>"
+          "<td><input type=text name='authcfgpw' placeholder='%s' size=30></td></tr>",
+          MxAuth.configPwSet() ? "impostata - scrivi per cambiarla" : "non impostata");
+  sendChunk("</table>");
+
+  sendChunk("<p style='max-width:34em;margin:1em auto;text-align:left;color:#555'>"
+            "<b>Solo POST</b> e' il modo sicuro: un comando valvola non si puo' piu' "
+            "mettere in un segnalibro, ne' innescare con un prefetch del browser o con "
+            "una &lt;img src&gt; in una pagina qualunque.<br>"
+            "<b>POST e GET</b> serve solo durante la transizione, per non rompere script "
+            "e segnalibri che esistono gia'. In quella modalita' il token viaggia in "
+            "query string, quindi finisce nei log e nella cronologia: e' un ripiego, non "
+            "un pari grado.<br>"
+            "<b>Togliendo il token</b> si torna al comportamento di prima: chiunque "
+            "sulla rete locale apre e chiude le valvole.<br>"
+            "I campi del token e della password si lasciano vuoti per non cambiarli. "
+            "Per cancellarli, o se la password di questa pagina si perde, si usa la "
+            "seriale: <code>auth token off</code>, <code>auth cfgpw off</code>.</p>");
+
+  sendChunk("<p><button type=submit>Salva</button></p></form>");
+  sendChunk("<p id='cfgnote' style='color:#555'></p>");
+
+  // Il salvataggio va in POST con gli header; i VALORI correnti si leggono da
+  // /config/data, perche' un browser che NAVIGA non puo' mettere header: la
+  // pagina si apre sempre, i valori arrivano solo a chi ha la password.
+  sendChunk("<script>"
+            "async function mxSaveCfg(e){e.preventDefault();"
+            "var f=document.getElementById('cfgform');"
+            "var r=await mxPost('/config/save',"
+            "new URLSearchParams(new FormData(f)).toString());"
+            "if(r){var j=await r.json().catch(function(){return {};});"
+            "if(j.reboot){alert('Salvato. La centralina si riavvia con la nuova mappa pin.');}"
+            "else{alert('Salvato.');location.reload();}}return false;}"
+            "(async function(){"
+            "var h={'X-Mx-Cfg':localStorage.getItem('mxcfgpw')||''};"
+            "var r=await fetch('/config/data',{headers:h});"
+            "if(r.status===401){mxCfg(true);"
+            "r=await fetch('/config/data',{headers:{'X-Mx-Cfg':"
+            "localStorage.getItem('mxcfgpw')||''}});}"
+            "if(!r.ok){document.getElementById('cfgnote').textContent="
+            "'Valori non disponibili: password della pagina mancante o errata.';return;}"
+            "var d=await r.json();"
+            "document.getElementById('cfgnote').textContent="
+            "'Token: '+(d.auth.token_set?'impostato':'NON impostato')+"
+            "' - azioni: '+(d.auth.allow_get?'POST e GET':'solo POST')+"
+            "(d.auth.misconfigured?' - ATTENZIONE: comandi bloccati':'');"
+            "})();"
+            "</script>");
+
+  // Tabella pin della scheda selezionata: chi apre questa pagina deve poter
+  // confrontare col cablaggio reale senza andare a cercare il sorgente.
+  sendChunk("<h4>Mappa pin di questa scheda</h4>");
+  sendChunk("<table border=1 cellpadding=5 style='margin:0 auto'>");
+  sendChunk("<tr><th>Valvola</th><th>lato A</th><th>lato B</th></tr>");
+  for (int i = 0; i < VALVE_COUNT; i++) {
+    sendFmt("<tr><td>V%d</td><td>GPIO %d</td><td>GPIO %d</td></tr>",
+            i + 1, valveA[i], valveB[i]);
+  }
+  sendFmt("<tr><td>Reset di fabbrica</td><td colspan=2>GPIO %d</td></tr>", factoryResetPin);
+  sendChunk("</table>");
+
+  sendChunk("<p style='color:#b00;max-width:34em;margin:1em auto;text-align:left'>"
+            "<b>Attenzione.</b> Cambiare scheda cambia gli 8 GPIO che pilotano i "
+            "ponti ad H. Se il modello non corrisponde al cablaggio reale, i "
+            "comandi finiscono su valvole sbagliate e il reset di fabbrica su un "
+            "pin gia' occupato.<br><br>"
+            "<b>Dopo un reset di fabbrica</b> questa scelta torna al default "
+            "(ESP32U): su una MINI-32 va rifatta <b>prima</b> di rimettere in "
+            "pressione l'impianto.</p>");
+
+  endHtml();
+}
+
+// Qui si arriva solo dopo checkAction + checkConfig (vedi registerRoutes):
+// senza il secondo, chiunque sulla LAN potrebbe rimettere "GET senza token"
+// dalla pagina stessa - il lucchetto sulla porta con la chiave appesa fuori.
+void handleConfigSave() {
+  if (!server.hasArg("board")) {
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"manca il modello\"}");
+    return;
+  }
+  int b = server.arg("board").toInt();
+  if (b < 0 || b >= BOARD_COUNT) {
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"modello sconosciuto\"}");
+    return;
+  }
+
+  // Sicurezza. I campi vuoti NON cancellano: si lasciano vuoti per non
+  // cambiare il segreto, e per cancellarlo c'e' la seriale.
+  if (server.hasArg("authget")) MxAuth.setAllowGet(server.arg("authget") == "1");
+  MxAuth.setRequireToken(server.hasArg("authreq"));
+  if (server.hasArg("authtok") && server.arg("authtok").length())
+    MxAuth.setToken(server.arg("authtok").c_str());
+  if (server.hasArg("authcfgpw") && server.arg("authcfgpw").length())
+    MxAuth.setConfigPassword(server.arg("authcfgpw").c_str());
+
+  // La scheda non e' cambiata: niente da riavviare. Riavviare per un token
+  // vorrebbe dire far cadere la rete e i comandi in coda per nulla.
+  if (b == boardModel) {
+    addCommandLog(0, "CFG");
+    Serial.println("[CFG] sicurezza aggiornata da web (scheda invariata)");
+    server.send(200, "application/json", "{\"ok\":true,\"reboot\":false}");
+    return;
+  }
+
+  saveBoard((uint8_t)b);
+  addCommandLog(0, "CFG");
+  Serial.printf("[CFG] scheda -> %s, riavvio\n", BOARDS[b].label);
+
+  // I pin sono gia' configurati come uscite con la mappa vecchia: cambiarli a
+  // caldo lascerebbe dei GPIO pilotati che non dovrebbero esserlo. Si riavvia.
+  server.send(200, "application/json", "{\"ok\":true,\"reboot\":true}");
+  delay(400);
+  ESP.restart();
+}
+
+// Valori correnti della configurazione, per la pagina. Separati dal guscio
+// HTML perche' un browser che NAVIGA non puo' mettere header: il guscio si
+// apre sempre, i valori arrivano solo a chi ha la password.
+void handleConfigData() {
+  String h = "{";
+  h += "\"board\":\""       + String(BOARDS[boardModel].id) + "\",";
+  h += "\"board_label\":\"" + String(BOARDS[boardModel].label) + "\",";
+  h += "\"factory_reset_pin\":" + String(factoryResetPin) + ",";
+  h += "\"valve_pulse_ms\":"    + String(VALVE_PULSE_MS) + ",";
+  h += MxAuth.statusJson();
+  h += "}";
+  server.send(200, "application/json", h);
+}
+
+// L'OTA cambia il firmware: e' un'azione, e passa dallo stesso controllo dei
+// comandi valvola. La libreria vuole un puntatore a funzione senza argomenti.
+static bool otaWebAuth() { return MxAuth.checkAction(server); }
+
+void registerRoutes() {
+  // ⚠️ Senza questa il WebServer dell'ESP32 SCARTA gli header che non gli sono
+  // stati dichiarati: server.header("X-Mx-Token") tornerebbe sempre vuoto e
+  // ogni comando sarebbe rifiutato con 401 senza che si capisca perche'.
+  MxAuth.collectHeaders(server);
+
+  // Pagine in sola lettura.
+  server.on("/",     HTTP_GET, []() { if (ensureAuthorized()) sendHomePage(); });
+  server.on("/info", HTTP_GET, []() { if (ensureAuthorized()) sendInfoPage(); });
+  server.on("/logs", HTTP_GET, []() { if (ensureAuthorized()) sendLogsPage(); });
+
+  // /status resta SENZA autenticazione, di proposito: lo leggono il pannello
+  // di stato e il collettore dei dati, che non hanno un posto sicuro dove
+  // tenere un segreto. Non cambia niente sul device e non espone segreti -
+  // MxAuth.statusJson() dice COM'E' configurata l'auth, non i valori.
+  server.on("/status", HTTP_GET, sendStatusJson);
+
+  // Il guscio della pagina di configurazione si apre sempre; i VALORI
+  // arrivano da /config/data e il SALVATAGGIO vuole token e password.
+  server.on("/config",      HTTP_GET, []() { if (ensureAuthorized()) sendConfigPage(); });
+  server.on("/config/data", HTTP_GET, []() { if (MxAuth.checkConfig(server)) handleConfigData(); });
+  server.on("/config/save", HTTP_ANY, []() {
+    if (!MxAuth.checkAction(server)) return;
+    if (!MxAuth.checkConfig(server)) return;
+    handleConfigSave();
+  });
+
+  // Aggiornamento su richiesta, in POST. La rotta GET la registra la libreria
+  // qui sotto: con le azioni in solo-POST quella risponde 405 con l'Allow, e
+  // un segnalibro vecchio riceve un errore onesto invece di avviare un
+  // aggiornamento senza token.
+  server.on("/ota", HTTP_POST, []() {
+    if (!MxAuth.checkAction(server)) return;
+    MxOta.pending = true;   // il download parte dal loop(), l'handler non resta appeso
+    server.send(200, "application/json", "{\"ok\":true,\"action\":\"ota\"}");
+  });
+  MxOta.attachWeb(server, "/ota", "/", otaWebAuth);
+
+  server.on("/reboot", HTTP_ANY, []() {
+    if (!MxAuth.checkAction(server)) return;
+    addCommandLog(0, "RBT");   // il campo action e' char[4]
+    server.send(200, "application/json", "{\"ok\":true,\"action\":\"reboot\"}");
+    delay(500);
+    ESP.restart();
+  });
+
+  // Valvole. HTTP_ANY perche' il metodo lo decide MxAuth: cosi' una GET
+  // rimasta in un segnalibro riceve 405 con l'header Allow, che dice cosa e'
+  // cambiato, e non un 404 che sembra un guasto.
+  for (int i = 0; i < VALVE_COUNT; i++) {
+    const int idx = i;
+    String onPath  = "/" + String(i + 1) + "/on";
+    String offPath = "/" + String(i + 1) + "/off";
+    server.on(onPath.c_str(),  HTTP_ANY, [idx]() {
+      if (!MxAuth.checkAction(server)) return;
+      handleValveOn(idx);
+    });
+    server.on(offPath.c_str(), HTTP_ANY, [idx]() {
+      if (!MxAuth.checkAction(server)) return;
+      handleValveOff(idx);
+    });
+  }
+
+  server.onNotFound([]() {
+    if (!ensureAuthorized()) return;
+    server.send(404, "text/plain", "Not found");
+  });
+}
+
+// =========================================================================
+// RECOVERY
+// =========================================================================
+
+void checkLowHeapRecovery() {
+#if ENABLE_AUTO_RESTART_ON_LOW_HEAP
+  uint32_t heap = ESP.getFreeHeap();
+  if (heap < LOW_HEAP_THRESHOLD) {
+    if (lowHeapSinceMs == 0) {
+      lowHeapSinceMs = millis();
+      Serial.printf("[HEAP] basso: %u byte\n", (unsigned)heap);
+    } else if (millis() - lowHeapSinceMs >= LOW_HEAP_GRACE_MS) {
+      Serial.printf("[HEAP] sotto %u byte da %lu ms: riavvio\n",
+                    (unsigned)LOW_HEAP_THRESHOLD, (unsigned long)LOW_HEAP_GRACE_MS);
+      delay(100);
+      ESP.restart();
+    }
+  } else {
+    lowHeapSinceMs = 0;
+  }
+#endif
+}
+
+// =========================================================================
+// CONSOLE SERIALE  (provisioning dell'identita' + diagnostica)
+// =========================================================================
+
+static void handleSerial() {
+  static char line[160];
+  static uint8_t n = 0;
+
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == '\r') continue;
+    if (c != '\n') { if (n < sizeof(line) - 1) line[n++] = c; continue; }
+    line[n] = '\0'; n = 0;
+
+    if (strncmp(line, "id set ", 7) == 0) {
+      // id set "Nome Pista" "nome-device" [apiBase] [apiToken] [ntfyUrl]
+      char* args[5] = {0}; int a = 0; char* p = line + 7;
+      while (*p && a < 5) {
+        while (*p == ' ') p++;
+        if (*p == '"') { args[a++] = ++p; while (*p && *p != '"') p++; }
+        else           { args[a++] = p;   while (*p && *p != ' ') p++; }
+        if (*p) *p++ = '\0';
+      }
+      if (a >= 2) {
+        MxIdentity.provision(args[0], args[1], args[2], args[3], args[4]);
+        Serial.println("[ID] scritto. Riavvia per applicare.");
+      } else {
+        Serial.println("uso: id set \"Nome Pista\" \"nome-device\" [apiBase] [apiToken] [ntfyUrl]");
+      }
+    } else if (strcmp(line, "id show") == 0) {
+      MxIdentity.printTo(Serial);
+    } else if (strcmp(line, "wifi reset") == 0) {
+      MxNet.factoryReset("comando seriale");
+    } else if (strcmp(line, "status") == 0) {
+      char buf[420]; MxCore.statusJson(buf, sizeof(buf));
+      Serial.println(buf);
+      Serial.printf("[VALVE] coda=%d busy=%s\n",
+                    valveQueue.count, currentPulse.active ? "si" : "no");
+    } else if (strncmp(line, "board", 5) == 0) {
+      const char* arg = (line[5] == ' ') ? line + 6 : nullptr;
+      if (!arg || !*arg) {
+        Serial.printf("[BOARD] attuale: %s (reset di fabbrica GPIO %d)\n",
+                      BOARDS[boardModel].label, factoryResetPin);
+        for (int b = 0; b < BOARD_COUNT; b++)
+          Serial.printf("        board %-8s -> %s\n", BOARDS[b].id, BOARDS[b].label);
+      } else {
+        int found = -1;
+        for (int b = 0; b < BOARD_COUNT; b++)
+          if (strcmp(arg, BOARDS[b].id) == 0) found = b;
+        if (found < 0) {
+          Serial.println("[BOARD] modello sconosciuto (usa 'board' per l'elenco)");
+        } else {
+          saveBoard((uint8_t)found);
+          Serial.printf("[BOARD] impostata %s, riavvio\n", BOARDS[found].label);
+          delay(200);
+          ESP.restart();
+        }
+      }
+    } else if (strncmp(line, "auth ", 5) == 0) {
+      char* a = line + 5;
+      if (strncmp(a, "token ", 6) == 0) {
+        MxAuth.setToken(a + 6);
+      } else if (strcmp(a, "token off") == 0) {
+        MxAuth.setToken("");
+      } else if (strncmp(a, "cfgpw ", 6) == 0) {
+        MxAuth.setConfigPassword(a + 6);
+      } else if (strcmp(a, "cfgpw off") == 0) {
+        // Via d'uscita se la password della pagina si dimentica: senza
+        // questa non si entrerebbe piu' in configurazione nemmeno per
+        // disattivarla.
+        MxAuth.setConfigPassword("");
+      } else if (strcmp(a, "get on") == 0) {
+        MxAuth.setAllowGet(true);
+        Serial.println("[AUTH] accetto anche GET (compatibilita'). Il token, se richiesto,");
+        Serial.println("[AUTH] viaggia in query string: finisce nei log e nella cronologia.");
+      } else if (strcmp(a, "get off") == 0) {
+        MxAuth.setAllowGet(false);
+        Serial.println("[AUTH] solo POST");
+      } else if (strcmp(a, "require on") == 0) {
+        MxAuth.setRequireToken(true);
+      } else if (strcmp(a, "require off") == 0) {
+        MxAuth.setRequireToken(false);
+        Serial.println("[AUTH] *** token NON piu' richiesto: chiunque sulla LAN comanda.");
+      } else if (strcmp(a, "show") == 0) {
+        MxAuth.printTo(Serial);   // non stampa mai i segreti
+      } else {
+        Serial.println("uso: auth token <v> | token off | cfgpw <v> | cfgpw off |");
+        Serial.println("     get on|off | require on|off | show");
+      }
+    } else if (strcmp(line, "ota") == 0) {
+      MxOta.pending = true;
+      Serial.println("[OTA] check richiesto");
+    } else if (strncmp(line, "v ", 2) == 0) {
+      // "v 3 on" / "v 3 off": comodo per provare le valvole senza rete
+      int num = atoi(line + 2);
+      const char* sp = strchr(line + 2, ' ');
+      if (num >= 1 && num <= VALVE_COUNT && sp) {
+        bool on = (strcmp(sp + 1, "on") == 0);
+        enqueueValveCommand(num - 1, on);
+      } else {
+        Serial.println("uso: v <1-8> on|off");
+      }
+    } else if (strcmp(line, "reboot") == 0) {
+      ESP.restart();
+    } else if (line[0]) {
+      Serial.println("comandi: id set / id show / wifi reset / status / board [id] /");
+      Serial.println("         auth ... / ota / v <n> on|off / reboot");
+    }
+  }
+}
+
+// =========================================================================
+// SETUP / LOOP
+// =========================================================================
+
+// Compone l'endpoint del pull OTA. Separata e definita qui sopra apposta:
+// l'IDE non genera sempre il prototipo per una funzione usata prima di essere
+// definita, ed e' un inciampo gia' visto in questo progetto.
+void buildOtaUrl() {
+  otaHttpUrl[0] = '\0';
+  if (!OTA_HTTP_BASE || !OTA_HTTP_BASE[0]) {
+    Serial.println("[OTA] pull disabilitato (OTA_HTTP_BASE vuoto)");
+    return;
+  }
+
+  const char* id = MxIdentity.provisioned() ? MxIdentity.deviceId() : "";
+  if (!id[0]) {
+    // Senza identita' il server non saprebbe chi ha chiamato. Non e' un
+    // motivo per rinunciare all'aggiornamento: il binario dipende da "fw",
+    // non da "id". Si avvisa e si manda un segnaposto riconoscibile.
+    Serial.println("[OTA] identita' non impostata: il server vedra' id=sconosciuto");
+    id = "sconosciuto";
+  }
+
+  int n = snprintf(otaHttpUrl, sizeof(otaHttpUrl), "%s?fw=%s&id=%s&token=%s",
+                   OTA_HTTP_BASE, OTA_FW_NAME, id, OTA_TOKEN ? OTA_TOKEN : "");
+  if (n < 0 || n >= (int)sizeof(otaHttpUrl)) {
+    otaHttpUrl[0] = '\0';
+    Serial.printf("[OTA] URL troppo lungo (%d caratteri, max %u): pull disabilitato\n",
+                  n, (unsigned)sizeof(otaHttpUrl) - 1);
+    return;
+  }
+  Serial.printf("[OTA] pull: fw=%s id=%s\n", OTA_FW_NAME, id);
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+  Serial.println();
+  Serial.println("Valve Latch Admin by MxSolutions.it - www.mxsolutions.it");
+  Serial.printf("Firmware %s su MxSolutionCore %s\n", FW_VERSION, MXCORE_VERSION);
+  Serial.println("----------------------------------------");
+
+  // PRIMA di ogni pinMode: senza sapere che scheda e', non si sa nemmeno
+  // quali GPIO toccare.
+  loadBoard();
+  Serial.printf("Scheda: %s | valvola1 A=%d B=%d | reset di fabbrica GPIO %d\n",
+                BOARDS[boardModel].label, valveA[0], valveB[0], factoryResetPin);
+
+  // PRIMA di tutto: valvole in uno stato noto. Sono 3,2 s bloccanti, ma
+  // devono avvenire prima della rete: MxCore.begin() puo' restare fermo
+  // minuti sul captive portal, e in quel tempo le valvole non possono
+  // essere in uno stato indefinito.
+  primeValvesOff();
+
+  // L'identita' serve PRIMA di comporre l'URL OTA. load() e' una semplice
+  // lettura da NVS, idempotente: MxCore.begin() la rifara' per conto suo.
+  MxIdentity.load();
+  buildOtaUrl();
+
+  cfg.fwVersion       = FW_VERSION;
+  cfg.wdtSeconds      = 15;
+  cfg.otaPassword     = OTA_PASSWORD;
+  cfg.otaHttpUrl      = otaHttpUrl;
+  cfg.factoryResetPin = factoryResetPin;   // dipende dal modello di scheda
+  cfg.requireIdentity = false;    // senza identita' le valvole devono comunque funzionare
+  cfg.staticIP        = STATIC_IP;
+  cfg.gateway         = GATEWAY;
+  cfg.subnet          = SUBNET;
+  cfg.dns1            = DNS1;
+  cfg.dns2            = DNS2;
+
+  MxCore.begin(cfg);   // identita' -> watchdog -> WiFi/portale -> NTP -> OTA
+
+  registerRoutes();
+  server.begin();
+  Serial.println("[HTTP] server avviato sulla porta 80");
+
+  // Ultima riga che si legge all'avvio: se i comandi sono bloccati, o se il
+  // nodo e' aperto a chiunque, va detto qui e non sepolto piu' in alto.
+  if (MxAuth.misconfigured()) {
+    Serial.println("[AUTH] *** COMANDI VALVOLA BLOCCATI: manca il token.");
+    Serial.println("[AUTH]     impostalo adesso con:  auth token <valore>");
+  } else if (!MxAuth.requireToken()) {
+    Serial.println("[AUTH] *** nessun token: chiunque sulla LAN apre le valvole.");
+  }
+}
+
+void loop() {
+  MxCore.loop();            // watchdog + WiFi + OTA + persistenza ora
+  server.handleClient();
+  serviceValveQueue();      // motore non bloccante della coda valvole
+  handleSerial();
+  checkLowHeapRecovery();
+  captureBootEpochIfNeeded();
+}

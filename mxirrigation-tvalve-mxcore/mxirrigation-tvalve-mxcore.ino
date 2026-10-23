@@ -3,8 +3,8 @@
  * Progetto:    MxIrrigation - Valvola a T motorizzata (zona ANFITEATRO)
  * File:        mxirrigation-tvalve-mxcore.ino
  * Autore:      Nicola Deboni - MxSolutions
- * Versione:    1.0.0
- * Ultima mod.: 2026-09-27
+ * Versione:    1.0.1
+ * Ultima mod.: 2026-10-17
  * Repository:  vault "03 - Elettronica/Progetti/mxirrigation" -> vedi
  *              [[tvalve-controller]] e [[mxirrigation]]
  * ----------------------------------------------------------------------------
@@ -42,11 +42,18 @@
  *   Flash:            QIO 80MHz, 4MB
  *
  *   Librerie (nome - versione esatta testata):
- *     MxSolutionCore  - 0.1.8   (0.1.6 per MxAuth, 0.1.8 per l'OTA che
+ *     MxSolutionCore  - 0.1.11  (0.1.6 per MxAuth, 0.1.8 per l'OTA che
  *                                funziona davvero: vedi la nota in fondo)
  *     (ESPping NON serve più: il ping è stato tolto, vedi note di versione)
  *
  * Note di versione:
+ *   2026-10-17 1.0.1 - La password ArduinoOTA non sta piu' in chiaro: nel
+ *                      sorgente c'e' solo lo SHA-256 (setPasswordHash). Da
+ *                      IDE/espota si digita la stessa password di prima.
+ *                    - (23/10, prima del rilascio) Compilata su
+ *                      MxSolutionCore 0.1.11: nome del prodotto
+ *                      "MxIrrigation Valvola a T by MxSolutions" nel titolo, in
+ *                      testa e in fondo a ogni pagina e nel portale WiFi.
  *   2026-09-27      - Ricompilato su MxSolutionCore 0.1.8 (nessuna modifica a
  *                      questo sketch). Cosa cambia sotto: l'OTA accetta la
  *                      risposta CHUNKED, che e' quella che manda il server
@@ -101,6 +108,7 @@
  */
 
 #include <MxCore.h>
+#include <ArduinoOTA.h>   // setPasswordHash(): la password OTA solo come hash
 #include <WebServer.h>
 #include <WiFi.h>        // solo per WiFi.setSleep(): il resto lo fa MxNet
 #include <Preferences.h>
@@ -109,7 +117,10 @@
 // Per btStop() / esp_bt_controller_disable()
 #include "esp_bt.h"
 
-const char* FW_VERSION = "1.0.0";
+const char* FW_VERSION = "1.0.1";
+// Nome del prodotto: le pagine e il portale WiFi mostrano
+// "MxIrrigation Valvola a T by MxSolutions" (core 0.1.11).
+const char* PRODUCT_NAME = "MxIrrigation Valvola a T";
 
 // =========================================================================
 // CONFIGURAZIONE
@@ -136,7 +147,12 @@ IPAddress DNS2     (8, 8, 8, 8);
 // Password di ArduinoOTA (push dall'IDE in LAN). Una password NORMALE: NON
 // l'hash bcrypt di config.php del server mxota, che è il segreto del pannello
 // di amministrazione e non deve finire nel binario di un device.
-const char* OTA_PASSWORD  = "mxirr-6fquf15vxeow";   // "" = ArduinoOTA disabilitato
+// Dalla 1.0.1 qui sta solo lo SHA-256 della password (64 caratteri hex), non
+// la password: chi legge il sorgente o il binario non la ricava. Dall'IDE o da
+// espota si digita la password vera, come prima. Per cambiarla:
+//   printf '%s' 'nuova-password' | sha256sum
+// Serve l'esp32 core 3.x (setPasswordHash accetta lo SHA-256 dalla 3.3).
+const char* OTA_PASSWORD_SHA256 = "00716367709476a6126eccbc51b455d5d15044f44f1d25bc192178ab0eb938c1";
 
 // L'URL del pull non si scrive a mano intero: "fw" sceglie QUALE binario il
 // server consegna, e sbagliarlo significa farsi installare il firmware di un
@@ -436,6 +452,15 @@ void sendFmt(const char* fmt, ...) {
   server.sendContent(buf);
 }
 
+// "MxIrrigation Valvola a T by MxSolutions": nel titolo della scheda, in testa e in fondo
+// a ogni pagina (regola MxSolutions, core 0.1.11). Il nome non contiene
+// caratteri HTML, quindi si manda cosi' com'e'.
+const char* brandBuf() {
+  static char b[80];
+  MxCore.brand(b, sizeof(b));
+  return b;
+}
+
 void startHtml(const char* title) {
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.send(200, "text/html", "");
@@ -468,10 +493,19 @@ void startHtml(const char* title) {
             "</script>");
   sendChunk("<title>");
   sendChunk(title);
+  sendChunk(" - ");
+  sendChunk(brandBuf());
   sendChunk("</title></head><body style='font-family:Arial,sans-serif;font-size:14px'>");
+  sendChunk("<p><b>");
+  sendChunk(brandBuf());
+  sendChunk("</b></p>");
 }
 
-void endHtml() { sendChunk("</body></html>"); }
+void endHtml() {
+  sendFmt("<p style='color:#666;font-size:12px'>%s &middot; firmware %s</p>",
+          brandBuf(), FW_VERSION);
+  sendChunk("</body></html>");
+}
 
 void sendNav() {
   sendChunk("<p><a href='/'>Home</a> | <a href='/info'>Info</a> | "
@@ -1159,8 +1193,12 @@ void setup() {
   buildOtaUrl();
 
   cfg.fwVersion       = FW_VERSION;
+  cfg.productName     = PRODUCT_NAME;
   cfg.wdtSeconds      = 15;
-  cfg.otaPassword     = OTA_PASSWORD;
+  // La libreria accende ArduinoOTA solo con una password non vuota e la passa
+  // a setPassword(): le si da l'hash per accenderlo, e subito dopo
+  // MxCore.begin() setPasswordHash() mette al suo posto l'hash vero e proprio.
+  cfg.otaPassword     = OTA_PASSWORD_SHA256;
   cfg.otaHttpUrl      = otaHttpUrl;
   cfg.factoryResetPin = FACTORY_RESET_PIN;
   cfg.requireIdentity = false;   // senza identità la valvola deve comunque funzionare
@@ -1174,6 +1212,7 @@ void setup() {
   MxOta.onBefore(onOtaBefore);
 
   MxCore.begin(cfg);   // identità -> watchdog -> WiFi/portale -> NTP -> OTA
+  ArduinoOTA.setPasswordHash(OTA_PASSWORD_SHA256);
 
   // Il risparmio energetico si applica DOPO: il captive portale e il primo
   // sync NTP girano a piena velocità.

@@ -3,8 +3,8 @@
  * Progetto:    MxIrrigation - Pump Controller
  * File:        mxirrigation-pump-mxcore.ino
  * Autore:      Nicola Deboni - MxSolutions
- * Versione:    1.7.0
- * Ultima mod.: 2026-09-19
+ * Versione:    1.7.1
+ * Ultima mod.: 2026-10-17
  * Repository:  vault "03 - Elettronica/Progetti/mxirrigation/firmware/
  *              mxirrigation-pump-mxcore" -> vedi [[pump-controller]]
  * ----------------------------------------------------------------------------
@@ -46,11 +46,26 @@
  *   Flash:            QIO 80MHz, 4MB
  *
  *   Librerie (nome - versione esatta testata):
- *     MxSolutionCore  - 0.1.8   (0.1.6 per MxAuth, 0.1.8 per l'OTA che
- *                                funziona davvero: vedi la nota in fondo)
+ *     MxSolutionCore  - 0.1.11  (0.1.6 per MxAuth, 0.1.8 per l'OTA che
+ *                                funziona davvero, 0.1.11 per il nome del
+ *                                prodotto nelle pagine)
  *     ESPping         - (quella già in uso dalla 1.3.0)
  *
  * Note di versione:
+ *   2026-10-17 1.7.1 - CORRETTO: dopo uno stop per alta pressione arrivavano
+ *                      altri "pompe spente" con notifica ogni maxDelayS, a
+ *                      pompe gia' ferme, finche' la pressione restava sopra
+ *                      soglia (valvole chiuse: non scende). Ora lo scatto vale
+ *                      una volta per sforamento: si riarma quando la pressione
+ *                      rientra o quando un rele' si riaccende. La protezione a
+ *                      pompe accese non cambia.
+ *                    - La password ArduinoOTA non sta piu' in chiaro: nel
+ *                      sorgente c'e' solo lo SHA-256 (setPasswordHash). Da
+ *                      IDE/espota si digita la stessa password di prima.
+ *                    - (23/10, prima del rilascio) Compilata su
+ *                      MxSolutionCore 0.1.11: nome del prodotto
+ *                      "MxIrrigation Pompe by MxSolutions" nel titolo, in
+ *                      testa e in fondo a ogni pagina e nel portale WiFi.
  *   2026-09-27      - Ricompilato su MxSolutionCore 0.1.8 (nessuna modifica a
  *                      questo sketch). Cosa cambia sotto: l'OTA accetta la
  *                      risposta CHUNKED, che e' quella che manda il server
@@ -139,6 +154,7 @@
  */
 
 #include <MxCore.h>
+#include <ArduinoOTA.h>   // setPasswordHash(): la password OTA solo come hash
 #include <WebServer.h>
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
@@ -146,7 +162,10 @@
 #include <ESPping.h>
 #include <esp_system.h>   // esp_reset_reason(): perche' e' ripartito
 
-const char* FW_VERSION = "1.7.0";
+const char* FW_VERSION = "1.7.1";
+// Nome del prodotto: le pagine e il portale WiFi mostrano
+// "MxIrrigation Pompe by MxSolutions" (core 0.1.11).
+const char* PRODUCT_NAME = "MxIrrigation Pompe";
 
 // =========================================================================
 // CONFIGURAZIONE DI FABBRICA
@@ -171,10 +190,16 @@ IPAddress DNS2     (1, 1, 1, 1);
 // chiamato, e viene preso dall'identita' del device A RUNTIME, cosi' lo stesso
 // sorgente puo' stare su piu' device senza che si confondano in manage.php.
 //
-// ATTENZIONE alla password ArduinoOTA: qui va una password NORMALE. NON
-// l'hash bcrypt di config.php del server mxota, che e' il segreto del pannello
-// di amministrazione e non deve finire nel binario di un device.
-const char* OTA_PASSWORD = "mxirr-6fquf15vxeow";
+// ATTENZIONE alla password ArduinoOTA: NON e' l'hash bcrypt di config.php del
+// server mxota, che e' il segreto del pannello di amministrazione e non deve
+// finire nel binario di un device.
+//
+// Dalla 1.7.1 qui sta solo lo SHA-256 della password (64 caratteri hex), non
+// la password: chi legge il sorgente o il binario non la ricava. Dall'IDE o da
+// espota si digita la password vera, come prima. Per cambiarla:
+//   printf '%s' 'nuova-password' | sha256sum
+// Serve l'esp32 core 3.x (setPasswordHash accetta lo SHA-256 dalla 3.3).
+const char* OTA_PASSWORD_SHA256 = "00716367709476a6126eccbc51b455d5d15044f44f1d25bc192178ab0eb938c1";
 const char* OTA_HTTP_BASE = "https://www.mxsolutions.it/mxota/api.php";
 const char* OTA_FW_NAME   = "mxirrigation-pump";
 const char* OTA_TOKEN     = "wmpUpdate";
@@ -417,6 +442,9 @@ static const unsigned long BOOT_NOTIFY_TIMEOUT_MS = 90000UL;   // 90 s
 bool bootNotifySent = false;
 
 unsigned long overStartMs = 0;  // da quando siamo sopra soglia
+// Alta pressione gia' scattata: resta vero finche' la pressione non rientra
+// sotto soglia o finche' un rele' non si riaccende. Vedi checkHighPressureTrip().
+bool highTripLatched = false;
 unsigned long underStartMs = 0; // da quando siamo sotto soglia
 
 // Preallarme: alzato quando manca poco al trip, azzerato appena la pressione
@@ -829,15 +857,32 @@ void servicePrealarm() {
   prealarmActive = now;
 }
 
+// Vero se almeno un rele' e' acceso. Si legge il pin e non masterOn: durante
+// il pre-stadio e' acceso il rele' 4 con masterOn ancora false, e la
+// protezione deve valere anche li'.
+bool anyRelayOn() {
+  for (int i = 0; i < numRelays; i++)
+    if (digitalRead(relayPins[i]) == HIGH) return true;
+  return false;
+}
+
 void checkHighPressureTrip() {
   uint16_t cb = rawToCentibar(raw);
 
   if (cb > cfgp.maxCb) {
+    // Gia' scattato e pompe ancora ferme: niente da spegnere. Senza questo,
+    // con l'impianto che resta in pressione a valvole chiuse, il conto
+    // ripartiva e ogni maxDelayS arrivavano un altro "pompe spente" e
+    // un'altra notifica (visto il 17/10/2026: quattro di fila).
+    if (highTripLatched && !anyRelayOn()) { overStartMs = 0; return; }
+    highTripLatched = false;   // una pompa e' ripartita: protezione piena
+
     if (overStartMs == 0) { overStartMs = millis(); return; }
 
     if (millis() - overStartMs >= cfgp.maxDelayS * 1000UL) {
       stopAllPumps("ALLARME: alta pressione, pompe spente (" + String(cb / 100.0f, 2) + " bar)");
       overStartMs = 0;
+      highTripLatched = true;
 
       pressureTripLog  = "<div style='margin-top:20px;padding:10px;border:2px solid red;color:red;'>";
       pressureTripLog += "<b>ALLARME: POMPE SPENTE - ALTA PRESSIONE</b><br>";
@@ -854,6 +899,7 @@ void checkHighPressureTrip() {
     }
   } else {
     overStartMs = 0;
+    highTripLatched = false;   // pressione rientrata: il prossimo sforamento conta
   }
 }
 
@@ -1092,6 +1138,19 @@ void servicePingMonitor() {
 // PAGINE WEB
 // =========================================================================
 
+// "MxIrrigation Pompe by MxSolutions": nel titolo della scheda, in testa e in
+// fondo a ogni pagina (regola MxSolutions, core 0.1.11).
+String brandStr() {
+  char b[80];
+  MxCore.brand(b, sizeof(b));
+  return String(b);
+}
+
+String pageFoot() {
+  return "<p class=hint>" + htmlEscape(brandStr()) + " &middot; firmware "
+         + String(FW_VERSION) + "</p></div></body></html>";
+}
+
 String pageHead(const char* title) {
   String h;
   h += "<!DOCTYPE HTML><html><head>";
@@ -1121,12 +1180,14 @@ String pageHead(const char* title) {
   h += "<meta http-equiv='Expires' content='0'>";
   h += "<title>";
   h += title;
+  h += " - " + htmlEscape(brandStr());
   h += "</title><style>body{font-family:Arial,sans-serif;font-size:14px}"
        "canvas{border:1px solid #444;max-width:100%}"
        "table.cfg{margin:0 auto;text-align:left}"
        "table.cfg td{padding:4px 8px}"
        "input[type=number],input[type=text]{padding:4px;width:10em}"
        ".hint{color:#666;font-size:12px}</style></head><body><div align=center>";
+  h += "<p><b>" + htmlEscape(brandStr()) + "</b></p>";
   return h;
 }
 
@@ -1142,7 +1203,7 @@ void handleRoot() {
   bool busy = pumpsBusy();
 
   String h = pageHead("MxIrrigation - Pompe");
-  h += "<h2>MxIrrigation Pump Controller</h2>";
+  h += "<h2>Stazione di pompaggio</h2>";
   h += navBar();
 
   h += "Stato pompe:";
@@ -1178,7 +1239,7 @@ void handleRoot() {
 
   h += pressureTripLog;
   h += lowPressureTripLog;
-  h += "</div></body></html>";
+  h += pageFoot();
   server.send(200, "text/html", h);
 }
 
@@ -1236,7 +1297,7 @@ void handleInfo() {
   h += "Campioni press. : " + String(pressHistCount) + " / " + String(PRESSURE_HISTORY_SAMPLES) + "\n";
   h += "</pre>";
   h += String("<p>") + MxOta.linkHtml() + "</p>";
-  h += "</div></body></html>";
+  h += pageFoot();
   server.send(200, "text/html", h);
 }
 
@@ -1253,7 +1314,8 @@ void handleLogs() {
       h += "<tr><td><pre style='margin:0'>" + htmlEscape(eventLogs[idx]) + "</pre></td></tr>";
     }
   }
-  h += "</table></div></body></html>";
+  h += "</table>";
+  h += pageFoot();
   server.send(200, "text/html", h);
 }
 
@@ -1335,7 +1397,8 @@ function draw(){
 draw();
 )JS";
 
-  h += "\n</script></div></body></html>";
+  h += "\n</script>";
+  h += pageFoot();
   server.send(200, "text/html", h);
 }
 
@@ -1516,7 +1579,7 @@ void handleConfig() {
 
   h += "<p class=hint>I valori sono salvati in NVS e sopravvivono al riavvio e "
        "all'aggiornamento OTA. Il reset di fabbrica del WiFi non li cancella.</p>";
-  h += "</div></body></html>";
+  h += pageFoot();
   server.send(200, "text/html", h);
 }
 
@@ -1927,8 +1990,12 @@ void setup() {
   buildOtaUrl();
 
   cfg.fwVersion       = FW_VERSION;
+  cfg.productName     = PRODUCT_NAME;
   cfg.wdtSeconds      = 15;
-  cfg.otaPassword     = OTA_PASSWORD;
+  // La libreria accende ArduinoOTA solo con una password non vuota e la passa
+  // a setPassword(): le si da l'hash per accenderlo, e subito dopo
+  // MxCore.begin() setPasswordHash() mette al suo posto l'hash vero e proprio.
+  cfg.otaPassword     = OTA_PASSWORD_SHA256;
   cfg.otaHttpUrl      = otaHttpUrl;
   cfg.factoryResetPin = FACTORY_RESET_PIN;
   cfg.requireIdentity = false;   // le pompe devono funzionare anche senza identita'
@@ -1939,6 +2006,7 @@ void setup() {
   cfg.dns2            = DNS2;
 
   MxCore.begin(cfg);
+  ArduinoOTA.setPasswordHash(OTA_PASSWORD_SHA256);
 
   bootMs = millis();
   pressureTimer = millis() + 1000;
